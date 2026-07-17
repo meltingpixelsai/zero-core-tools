@@ -28,7 +28,7 @@ export async function createPage(options?: {
       height: options?.height ?? 720,
     },
     userAgent:
-      "Mozilla/5.0 (compatible; HarveyTools/1.0; +https://tools.rugslayer.com) AppleWebKit/537.36 Chrome/120.0.0.0",
+      "Mozilla/5.0 (compatible; ZeroCoreTools/1.0; +https://tools.rugslayer.com) AppleWebKit/537.36 Chrome/120.0.0.0",
   });
 
   const blockMedia = options?.blockMedia !== false;

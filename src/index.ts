@@ -29,7 +29,7 @@ function toolError(err: unknown) {
 
 function listTools() {
   return {
-    server: "harvey-tools",
+    server: "zero-core-tools",
     version: "1.0.0",
     payment: { network: config.payment.network, currency: config.payment.currency, method: "x402" },
     tools: [
@@ -49,7 +49,7 @@ function listTools() {
 function health() {
   return {
     status: "ok",
-    server: "harvey-tools",
+    server: "zero-core-tools",
     version: "1.0.0",
     uptime: Math.floor(process.uptime()),
     payment: {
@@ -244,7 +244,7 @@ const paidHandler = createMcpPaidHandler(
     },
   },
   {
-    serverInfo: { name: "harvey-tools", version: "1.0.0" },
+    serverInfo: { name: "zero-core-tools", version: "1.1.0" },
   },
   {
     maxDuration: 300,
