@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { config } from "../config.js";
+import { assertUrlSafe, isUrlSafe } from "./ssrf.js";
 
 let browser: Browser | null = null;
 
@@ -30,16 +31,35 @@ export async function createPage(options?: {
       "Mozilla/5.0 (compatible; HarveyTools/1.0; +https://tools.rugslayer.com) AppleWebKit/537.36 Chrome/120.0.0.0",
   });
 
-  // Block heavy resources for scraping (faster + cheaper)
-  if (options?.blockMedia !== false) {
-    await page.route("**/*", (route) => {
-      const type = route.request().resourceType();
-      if (["image", "font", "media", "stylesheet"].includes(type)) {
-        return route.abort();
-      }
-      return route.continue();
-    });
-  }
+  const blockMedia = options?.blockMedia !== false;
+
+  // Registered UNCONDITIONALLY (screenshots pass blockMedia:false, which
+  // previously meant no interceptor at all): every request the browser makes
+  // — the main navigation, redirects, and subresources — is SSRF-checked, so
+  // a redirect to http://169.254.169.254 or an <img src> pointing at an
+  // internal host is aborted rather than fetched. Media is additionally
+  // dropped here when blockMedia is set. A per-page cache keeps a busy page
+  // from re-resolving the same host on every asset.
+  const safeHostCache = new Map<string, Promise<boolean>>();
+  await page.route("**/*", async (route) => {
+    const request = route.request();
+    if (blockMedia && ["image", "font", "media", "stylesheet"].includes(request.resourceType())) {
+      return route.abort();
+    }
+    const url = request.url();
+    let key: string;
+    try {
+      key = new URL(url).host;
+    } catch {
+      return route.abort("blockedbyclient");
+    }
+    let verdict = safeHostCache.get(key);
+    if (!verdict) {
+      verdict = isUrlSafe(url);
+      safeHostCache.set(key, verdict);
+    }
+    return (await verdict) ? route.continue() : route.abort("blockedbyclient");
+  });
 
   page.setDefaultTimeout(config.browser.timeout);
   return page;
@@ -47,6 +67,9 @@ export async function createPage(options?: {
 
 /** Navigate to URL and wait for content to settle */
 export async function navigateTo(page: Page, url: string): Promise<void> {
+  // Fail fast with a clear error before the browser touches the network. The
+  // route interceptor (createPage) is the backstop for redirects/subresources.
+  await assertUrlSafe(url);
   await page.goto(url, { waitUntil: "networkidle", timeout: config.browser.timeout });
 }
 

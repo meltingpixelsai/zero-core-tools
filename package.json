@@ -16,7 +16,8 @@
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/lib/ssrf.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.5",
