@@ -67,26 +67,89 @@ function v4ToInt(ip: string): number | null {
   return n >>> 0;
 }
 
-function isBlockedV4(ip: string): boolean {
-  const n = v4ToInt(ip);
-  if (n === null) return true; // unparseable in a v4 context → treat as unsafe
+function isBlockedV4Int(n: number): boolean {
   for (const [base, bits] of BLOCKED_V4_CIDRS) {
     const b = v4ToInt(base);
     if (b === null) continue;
     const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-    if ((n & mask) >>> 0 === (b & mask) >>> 0) return true;
+    if (((n & mask) >>> 0) === ((b & mask) >>> 0)) return true;
   }
   return false;
 }
 
+function isBlockedV4(ip: string): boolean {
+  const n = v4ToInt(ip);
+  if (n === null) return true; // unparseable in a v4 context → treat as unsafe
+  return isBlockedV4Int(n);
+}
+
+/** Blocks an embedded-IPv4 carried in two 16-bit IPv6 hextets. */
+function isBlockedEmbeddedV4(hi: number, lo: number): boolean {
+  return isBlockedV4Int((((hi & 0xffff) << 16) | (lo & 0xffff)) >>> 0);
+}
+
+/**
+ * Expands an IPv6 literal (already validated by net.isIP) to its 8 hextets,
+ * resolving `::` compression and a trailing embedded dotted-quad. Returns null
+ * only on a malformed input (treated as unsafe by the caller).
+ */
+function v6Hextets(ip: string): number[] | null {
+  let s = ip.toLowerCase();
+  const zone = s.indexOf("%");
+  if (zone >= 0) s = s.slice(0, zone); // strip scope id (fe80::1%eth0)
+
+  // Fold a trailing embedded IPv4 (e.g. ::ffff:1.2.3.4) into two hextets so
+  // the rest of the parser only deals with hex groups.
+  if (s.includes(".")) {
+    const colon = s.lastIndexOf(":");
+    if (colon < 0) return null;
+    const v4 = v4ToInt(s.slice(colon + 1));
+    if (v4 === null) return null;
+    s = s.slice(0, colon + 1) +
+      ((v4 >>> 16) & 0xffff).toString(16) + ":" + (v4 & 0xffff).toString(16);
+  }
+
+  const parseGroups = (part: string): number[] =>
+    part === "" ? [] : part.split(":").map((h) => parseInt(h, 16));
+
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+
+  if (halves.length === 1) {
+    const groups = parseGroups(s);
+    return groups.length === 8 && groups.every((g) => g >= 0 && g <= 0xffff) ? groups : null;
+  }
+
+  const head = parseGroups(halves[0]);
+  const tail = parseGroups(halves[1]);
+  const missing = 8 - head.length - tail.length;
+  if (missing < 1) return null; // :: must stand for at least one 0 group
+  const full = [...head, ...Array<number>(missing).fill(0), ...tail];
+  return full.length === 8 && full.every((g) => g >= 0 && g <= 0xffff) ? full : null;
+}
+
 function isBlockedV6(ip: string): boolean {
-  const a = ip.toLowerCase();
-  if (a === "::1" || a === "::") return true; // loopback, unspecified
-  if (/^fe[89ab]/.test(a)) return true; // fe80::/10 link-local
-  if (/^f[cd]/.test(a)) return true; // fc00::/7 unique-local
-  // IPv4-mapped (::ffff:a.b.c.d) — validate the embedded v4.
-  const mapped = a.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (mapped) return isBlockedV4(mapped[1]);
+  const h = v6Hextets(ip);
+  if (!h) return true; // malformed → unsafe
+
+  if (h.every((g) => g === 0)) return true; // :: unspecified
+  if (h.slice(0, 7).every((g) => g === 0) && h[7] === 1) return true; // ::1 loopback
+  if ((h[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((h[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if ((h[0] & 0xffc0) === 0xfec0) return true; // fec0::/10 deprecated site-local
+
+  // Every form that embeds an IPv4 address must have that v4 range-checked —
+  // new URL() serializes IPv4-mapped to hex (::ffff:7f00:1), so a dotted-only
+  // match is dead code on the real path (the ::ffff:169.254.169.254 metadata
+  // bypass). Decode the embedded v4 by structure instead.
+  const first6Zero = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0;
+  if (first6Zero && h[5] === 0xffff) return isBlockedEmbeddedV4(h[6], h[7]); // ::ffff:0:0/96 mapped
+  if (first6Zero && h[5] === 0) return isBlockedEmbeddedV4(h[6], h[7]); // ::/96 IPv4-compatible (deprecated)
+  if (h[0] === 0x0064 && h[1] === 0xff9b) return isBlockedEmbeddedV4(h[6], h[7]); // 64:ff9b::/96 NAT64
+  if (h[0] === 0x2002) return isBlockedEmbeddedV4(h[1], h[2]); // 2002::/16 6to4
+  if (h[0] === 0x2001 && h[1] === 0x0000) {
+    return isBlockedEmbeddedV4(h[6] ^ 0xffff, h[7] ^ 0xffff); // 2001:0000::/32 Teredo (client v4 is XOR-obfuscated)
+  }
   return false;
 }
 
@@ -103,6 +166,18 @@ function bareHost(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]")
     ? hostname.slice(1, -1)
     : hostname;
+}
+
+// The resolver is indirected so tests can exercise the DNS allow/deny loop
+// hermetically (real hostnames would need the network). Production always
+// uses getaddrinfo via dns/promises.lookup.
+export type ResolveFn = (host: string) => Promise<Array<{ address: string }>>;
+const defaultResolve: ResolveFn = (host) => lookup(host, { all: true, verbatim: true });
+let resolveHost: ResolveFn = defaultResolve;
+
+/** Test-only: override (or reset with null) the DNS resolver. */
+export function __setResolverForTests(fn: ResolveFn | null): void {
+  resolveHost = fn ?? defaultResolve;
 }
 
 /**
@@ -139,7 +214,7 @@ export async function assertUrlSafe(rawUrl: string): Promise<void> {
 
   let addresses: Array<{ address: string }>;
   try {
-    addresses = await lookup(host, { all: true, verbatim: true });
+    addresses = await resolveHost(host);
   } catch {
     throw new SsrfError(`Could not resolve host: ${host}`);
   }
