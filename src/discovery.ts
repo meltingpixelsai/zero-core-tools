@@ -54,8 +54,8 @@ const LLMS_TXT = `# Zero Core Tools - General-Purpose Agent Tools MCP Server
 
 ## Connection
 - [MCP Endpoint](https://tools.rugslayer.com/mcp): Connect directly via MCP
-- [npm](https://www.npmjs.com/package/@meltingpixels/harvey-tools): @meltingpixels/harvey-tools
-- [Claude Code](https://tools.rugslayer.com/mcp): claude mcp add harvey-tools --transport http https://tools.rugslayer.com/mcp
+- [npm](https://www.npmjs.com/package/@meltingpixels/zero-core-tools): @meltingpixels/zero-core-tools
+- [Claude Code](https://tools.rugslayer.com/mcp): claude mcp add zero-core-tools --transport http https://tools.rugslayer.com/mcp
 
 ## Authentication
 - [x402 USDC](https://tools.rugslayer.com/mcp): Pay per call on Solana, no account needed
@@ -171,7 +171,7 @@ const AGENT_CARD = {
 
 const MCP_CARD = {
   mcp_version: "2025-11-25",
-  name: "harvey-tools",
+  name: "zero-core-tools",
   display_name: "Zero Core Tools - General-Purpose Agent Tools",
   description:
     "MCP server for AI agents. Web scraping, screenshots, structured data extraction, code review, content generation, and sentiment analysis. Pay per call with USDC via x402.",
@@ -309,11 +309,11 @@ const MCP_CARD = {
     },
   ],
   install: {
-    npm: "npx -y @meltingpixels/harvey-tools",
-    claude_code: "claude mcp add harvey-tools --transport http https://tools.rugslayer.com/mcp",
+    npm: "npx -y @meltingpixels/zero-core-tools",
+    claude_code: "claude mcp add zero-core-tools --transport http https://tools.rugslayer.com/mcp",
     claude_desktop: {
       command: "npx",
-      args: ["-y", "@meltingpixels/harvey-tools"],
+      args: ["-y", "@meltingpixels/zero-core-tools"],
       env: {},
     },
   },

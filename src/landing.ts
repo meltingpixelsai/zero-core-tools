@@ -1,13 +1,13 @@
-// ── Landing pages for Harvey Tools ──────────────────────────
+// ── Landing pages for Zero Core Tools ──────────────────────────
 
 const SERVER = {
-  name: "HARVEY TOOLS",
-  slug: "harvey-tools",
+  name: "ZERO CORE TOOLS",
+  slug: "zero-core-tools",
   tagline: "General-purpose tools for autonomous agents",
   url: "https://tools.rugslayer.com",
   color: "#00d4ff",
   colorDim: "#00a8cc",
-  npm: "@meltingpixels/harvey-tools",
+  npm: "@meltingpixels/zero-core-tools",
   github: "https://github.com/meltingpixelsai/harvey-tools",
   tools: [
     { name: "list_tools", desc: "List all tools with pricing", price: "FREE" },
