@@ -10,7 +10,6 @@ import { scrapeUrl, screenshotUrl, extractStructuredData } from "./tools/scrapin
 import { reviewCode } from "./tools/code-review.js";
 import { generateContent } from "./tools/content.js";
 import { analyzeSentiment } from "./tools/sentiment.js";
-import { searchWeb } from "./tools/search.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -41,7 +40,6 @@ function listTools() {
       { name: "review_code", description: "Security + quality code review", price: "$0.03" },
       { name: "generate_content", description: "Generate blog posts, docs, descriptions", price: "$0.05" },
       { name: "analyze_sentiment", description: "Sentiment analysis + entity extraction", price: "$0.01" },
-      { name: "search_web", description: "Search the web via Google, return organic results", price: "$0.01" },
     ],
   };
 }
@@ -59,7 +57,7 @@ function health() {
       facilitator: config.payment.facilitator,
       method: "x402",
     },
-    capabilities: ["web-scraping", "screenshots", "structured-extraction", "code-review", "content-generation", "sentiment-analysis", "web-search"],
+    capabilities: ["web-scraping", "screenshots", "structured-extraction", "code-review", "content-generation", "sentiment-analysis"],
   };
 }
 
@@ -206,26 +204,6 @@ const paidHandler = createMcpPaidHandler(
       async ({ text }: { text: string }) => {
         try {
           return toolResult(await analyzeSentiment(text));
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
-
-    // ── Web search ──
-
-    server.paidTool(
-      "search_web",
-      "Search the web via Google and return organic results with titles, links, and snippets. Optionally returns answer box if available.",
-      "$0.01",
-      {
-        query: z.string().min(1).describe("Search query"),
-        num_results: z.number().min(1).max(50).optional().describe("Number of results to return (default: 10)"),
-      },
-      {},
-      async ({ query, num_results }: { query: string; num_results?: number }) => {
-        try {
-          return toolResult(await searchWeb(query, num_results ?? 10));
         } catch (err) {
           return toolError(err);
         }

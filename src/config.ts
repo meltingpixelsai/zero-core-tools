@@ -24,7 +24,6 @@ export const config = {
     review_code: 0.03,
     generate_content: 0.05,
     analyze_sentiment: 0.01,
-    search_web: 0.01,
   },
 
   // Browser config

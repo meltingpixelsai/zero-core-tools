@@ -45,8 +45,7 @@
         "extract_structured_data": "$0.02",
         "review_code": "$0.03",
         "generate_content": "$0.05",
-        "analyze_sentiment": "$0.01",
-        "search_web": "$0.01"
+        "analyze_sentiment": "$0.01"
       },
       "free_tools": ["list_tools", "health"]
     }

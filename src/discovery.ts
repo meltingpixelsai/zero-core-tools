@@ -50,7 +50,6 @@ const LLMS_TXT = `# Zero Core Tools - General-Purpose Agent Tools MCP Server
 - [review_code](https://tools.rugslayer.com/mcp): Security + quality code review ($0.03)
 - [generate_content](https://tools.rugslayer.com/mcp): Generate blog posts, docs, descriptions ($0.05)
 - [analyze_sentiment](https://tools.rugslayer.com/mcp): Sentiment analysis + entity extraction ($0.01)
-- [search_web](https://tools.rugslayer.com/mcp): Search the web via Google ($0.01)
 
 ## Connection
 - [MCP Endpoint](https://tools.rugslayer.com/mcp): Connect directly via MCP
@@ -67,7 +66,6 @@ const LLMS_TXT = `# Zero Core Tools - General-Purpose Agent Tools MCP Server
 - review_code: $0.03 USDC per call
 - generate_content: $0.05 USDC per call
 - analyze_sentiment: $0.01 USDC per call
-- search_web: $0.01 USDC per call
 `;
 
 const AGENT_CARD = {
@@ -157,15 +155,6 @@ const AGENT_CARD = {
       inputModes: ["application/json"],
       outputModes: ["application/json"],
     },
-    {
-      id: "web-search",
-      name: "Web Search",
-      description: "Search the web via Google and return organic results with titles, links, and snippets.",
-      tags: ["search", "google", "web", "serper"],
-      examples: ["Search for recent AI agent news", "Find documentation for this library"],
-      inputModes: ["application/json"],
-      outputModes: ["application/json"],
-    },
   ],
 };
 
@@ -191,7 +180,6 @@ const MCP_CARD = {
       review_code: "$0.03",
       generate_content: "$0.05",
       analyze_sentiment: "$0.01",
-      search_web: "$0.01",
     },
     payment_methods: ["x402_usdc_solana"],
   },
@@ -294,19 +282,6 @@ const MCP_CARD = {
         },
       },
     },
-    {
-      name: "search_web",
-      description: "Search the web via Google. Returns organic results with titles, links, and snippets.",
-      price: "$0.01 USDC",
-      input_schema: {
-        type: "object",
-        required: ["query"],
-        properties: {
-          query: { type: "string", description: "Search query" },
-          num_results: { type: "number", description: "Number of results (default: 10, max: 50)" },
-        },
-      },
-    },
   ],
   install: {
     npm: "npx -y @meltingpixels/zero-core-tools",
@@ -317,6 +292,6 @@ const MCP_CARD = {
       env: {},
     },
   },
-  categories: ["web-scraping", "code-review", "content-generation", "analysis", "web-search"],
-  tags: ["scraping", "playwright", "ai", "code-review", "content", "sentiment", "search", "x402", "usdc"],
+  categories: ["web-scraping", "code-review", "content-generation", "analysis"],
+  tags: ["scraping", "playwright", "ai", "code-review", "content", "sentiment", "x402", "usdc"],
 };
