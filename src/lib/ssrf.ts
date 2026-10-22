@@ -1,5 +1,6 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { networkInterfaces } from "node:os";
 
 /**
  * SSRF protection for the URL-consuming paid tools (scrape_url,
@@ -7,7 +8,11 @@ import { isIP } from "node:net";
  * to a URL supplied by an external, paying caller — `z.string().url()` only
  * checks syntax, so without this guard an agent could reach the cloud
  * metadata endpoint (169.254.169.254), loopback services (127.0.0.1:4000),
- * or any RFC-1918 host behind the server.
+ * or any RFC-1918 host behind the server. The server's own interface
+ * addresses (its public IPv4/IPv6 included) count as internal too: a
+ * connection to them from this host arrives on loopback, reaching every
+ * service bound to all interfaces without passing the reverse proxy or the
+ * host firewall.
  *
  * The guard runs in three places (see browser.ts and egress-proxy.ts):
  *   1. Before navigation — assertUrlSafe() gives a clean error and fails fast.
@@ -165,6 +170,56 @@ export function isBlockedIp(ip: string): boolean {
   return true; // not a recognizable IP literal → unsafe
 }
 
+// The interface list is indirected so tests can stand in for the server's
+// addresses. It is read once per check, since addresses can change while the
+// process runs.
+export type InterfaceAddressesFn = () => string[];
+const defaultInterfaceAddresses: InterfaceAddressesFn = () =>
+  Object.values(networkInterfaces()).flatMap((list) => (list ?? []).map((a) => a.address));
+let interfaceAddresses: InterfaceAddressesFn = defaultInterfaceAddresses;
+
+/** Test-only: override (or reset with null) the server's interface addresses. */
+export function __setInterfaceAddressesForTests(fn: InterfaceAddressesFn | null): void {
+  interfaceAddresses = fn ?? defaultInterfaceAddresses;
+}
+
+/**
+ * One spelling per address, so the server's addresses match however a caller
+ * writes them: "4:<int>" for IPv4 and IPv4-mapped IPv6 (::ffff:a.b.c.d, which
+ * connects to the IPv4 address), "6:<hextets>" for other IPv6.
+ */
+function addressKey(ip: string): string | null {
+  const family = isIP(ip);
+  if (family === 4) {
+    const n = v4ToInt(ip);
+    return n === null ? null : `4:${n}`;
+  }
+  if (family === 6) {
+    const h = v6Hextets(ip);
+    if (!h) return null;
+    const mapped = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff;
+    if (mapped) return `4:${(((h[6] & 0xffff) << 16) | (h[7] & 0xffff)) >>> 0}`;
+    return `6:${h.join(":")}`;
+  }
+  return null;
+}
+
+/** The keys of this server's own interface addresses, read now. */
+function ownAddressKeys(): Set<string> {
+  const keys = new Set<string>();
+  for (const own of interfaceAddresses()) {
+    const key = addressKey(own);
+    if (key !== null) keys.add(key);
+  }
+  return keys;
+}
+
+/** True if the given IP literal is one of this server's own interface addresses. */
+export function isOwnAddress(ip: string, own: ReadonlySet<string> = ownAddressKeys()): boolean {
+  const key = addressKey(ip);
+  return key !== null && own.has(key);
+}
+
 /** Strips the [] wrapper Node puts around IPv6 hostnames. */
 function bareHost(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]")
@@ -222,7 +277,7 @@ export async function resolvePublicAddresses(host: string): Promise<string[]> {
 
   // Fast path: literal IP — check before any DNS.
   if (isIP(host)) {
-    if (isBlockedIp(host)) {
+    if (isBlockedIp(host) || isOwnAddress(host)) {
       throw new SsrfError(`Blocked private/internal address: ${host}`);
     }
     return [host];
@@ -237,8 +292,9 @@ export async function resolvePublicAddresses(host: string): Promise<string[]> {
   if (addresses.length === 0) {
     throw new SsrfError(`Host did not resolve: ${host}`);
   }
+  const own = ownAddressKeys();
   for (const { address } of addresses) {
-    if (isBlockedIp(address)) {
+    if (isBlockedIp(address) || isOwnAddress(address, own)) {
       throw new SsrfError(`Host ${host} resolves to a private/internal address: ${address}`);
     }
   }

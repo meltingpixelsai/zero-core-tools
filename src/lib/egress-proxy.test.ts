@@ -4,7 +4,7 @@ import dns from "node:dns";
 import http from "node:http";
 import net from "node:net";
 import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
-import { __setResolverForTests, resolvePublicAddresses } from "./ssrf.js";
+import { __setInterfaceAddressesForTests, __setResolverForTests, resolvePublicAddresses } from "./ssrf.js";
 
 // Every server here listens on 127.0.0.1 and every refused destination is
 // refused before any connect, so the suite makes no outbound network call.
@@ -124,6 +124,48 @@ test("refuses a host whose DNS answers include a private address (rebinding reco
   } finally {
     __setResolverForTests(null);
     await proxy.close();
+  }
+});
+
+test("refuses the server's own public addresses in every request form, without connecting", async () => {
+  // Stand-in for the server's public addresses. The upstream connect is
+  // intercepted, so even a regression could not reach the network: any
+  // attempt to leave 127.0.0.1 is recorded and refused here.
+  const realConnect = net.connect;
+  const upstream: string[] = [];
+  const guarded = (...args: unknown[]): net.Socket => {
+    const first = args[0];
+    if (typeof first === "object" && first !== null && "host" in first) {
+      const host = String((first as { host?: unknown }).host);
+      if (host !== "127.0.0.1") {
+        upstream.push(host);
+        throw new Error(`test refused an upstream connect to ${host}`);
+      }
+    }
+    return (realConnect as (...a: unknown[]) => net.Socket)(...args);
+  };
+  (net as unknown as { connect: unknown }).connect = guarded;
+  __setInterfaceAddressesForTests(() => ["127.0.0.1", "151.101.1.69", "2a01:4ff:f0:1234::1"]);
+  __setResolverForTests(async () => [{ address: "151.101.1.69" }]);
+  const proxy = await startEgressProxy();
+  try {
+    const cases: Array<[string, Buffer]> = [
+      ["ipv4 151.101.1.69", ipv4Request("151.101.1.69", 4000)],
+      ["ipv6 2a01:4ff:f0:1234::1", ipv6Request([0x2a01, 0x04ff, 0x00f0, 0x1234, 0, 0, 0, 1], 3000)],
+      ["ipv6 ::ffff:151.101.1.69", ipv6Request([0, 0, 0, 0, 0, 0xffff, 0x9765, 0x0145], 8403)],
+      ["domain resolving to it", domainRequest("self.example", 443)],
+    ];
+    for (const [name, request] of cases) {
+      const { rep, socket } = await socks(proxy, request);
+      socket.destroy();
+      assert.equal(rep, REP_NOT_ALLOWED, name);
+    }
+    assert.deepEqual(upstream, [], "no upstream connection was attempted");
+  } finally {
+    await proxy.close();
+    __setResolverForTests(null);
+    __setInterfaceAddressesForTests(null);
+    (net as unknown as { connect: unknown }).connect = realConnect;
   }
 });
 
