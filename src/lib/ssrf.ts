@@ -9,17 +9,21 @@ import { isIP } from "node:net";
  * metadata endpoint (169.254.169.254), loopback services (127.0.0.1:4000),
  * or any RFC-1918 host behind the server.
  *
- * The guard runs in two places (see browser.ts):
+ * The guard runs in three places (see browser.ts and egress-proxy.ts):
  *   1. Before navigation — assertUrlSafe() gives a clean error and fails fast.
- *   2. On every browser request via a route interceptor — closes redirect-to-
- *      internal and internal-subresource vectors that a pre-check can't see.
+ *   2. On requests the page's route interceptor sees — an early abort for
+ *      internal subresources. Playwright does NOT call route handlers for
+ *      redirect hops, so this layer alone cannot stop a public URL that 302s
+ *      to an internal address.
+ *   3. On every TCP connection the browser opens — the SOCKS5 egress proxy
+ *      (egress-proxy.ts) resolves the destination with resolvePublicAddresses()
+ *      and connects only to the addresses it just checked. This is the layer
+ *      that covers redirect hops, iframes, popups, workers and websockets, and
+ *      it pins the connection to the checked address (no DNS-rebinding gap).
  *
- * Resolution is delegated to the OS resolver (getaddrinfo), the same family
- * Chromium uses, so decimal/octal/hex IP encodings (http://2130706433) are
- * normalized to their real address before the range check — matching what the
- * browser will actually connect to. The residual is classic DNS-rebinding
- * (our lookup vs the browser's connect are two separate resolutions); the
- * complete defense for that is an egress network policy, tracked separately.
+ * Resolution is delegated to the OS resolver (getaddrinfo), so decimal/octal/
+ * hex IP encodings (http://2130706433) are normalized to their real address
+ * before the range check.
  */
 
 export class SsrfError extends Error {
@@ -204,12 +208,24 @@ export async function assertUrlSafe(rawUrl: string): Promise<void> {
   const host = bareHost(url.hostname);
   if (!host) throw new SsrfError("URL has no host");
 
-  // Fast path: literal IP in the URL — check before any DNS.
+  await resolvePublicAddresses(host);
+}
+
+/**
+ * Resolves `host` (a hostname or a bare IP literal) and returns the addresses
+ * it resolves to, throwing SsrfError unless every one of them is public. The
+ * egress proxy connects only to the addresses returned here, so the address
+ * that was checked is the address that is used.
+ */
+export async function resolvePublicAddresses(host: string): Promise<string[]> {
+  if (!host) throw new SsrfError("Empty host");
+
+  // Fast path: literal IP — check before any DNS.
   if (isIP(host)) {
     if (isBlockedIp(host)) {
       throw new SsrfError(`Blocked private/internal address: ${host}`);
     }
-    return;
+    return [host];
   }
 
   let addresses: Array<{ address: string }>;
@@ -226,6 +242,7 @@ export async function assertUrlSafe(rawUrl: string): Promise<void> {
       throw new SsrfError(`Host ${host} resolves to a private/internal address: ${address}`);
     }
   }
+  return addresses.map(({ address }) => address);
 }
 
 /** Non-throwing form for the per-request route interceptor. */
