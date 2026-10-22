@@ -1,16 +1,45 @@
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser, type LaunchOptions, type Page } from "playwright";
 import { config } from "../config.js";
+import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
 import { assertUrlSafe, isUrlSafe } from "./ssrf.js";
 
 let browser: Browser | null = null;
+let egressProxy: Promise<EgressProxy> | null = null;
+
+/** Start (once) the SSRF egress proxy every browser connection goes through. */
+function getEgressProxy(): Promise<EgressProxy> {
+  if (!egressProxy) {
+    const starting = startEgressProxy();
+    egressProxy = starting;
+    starting.catch(() => {
+      if (egressProxy === starting) egressProxy = null; // retry on next launch
+    });
+  }
+  return egressProxy;
+}
+
+/**
+ * Launch options for the shared browser. All browser traffic leaves through
+ * the SSRF egress proxy (egress-proxy.ts), which checks every connection —
+ * including redirect hops, which page.route never sees. "<-loopback>" stops
+ * Chromium's implicit proxy bypass for localhost and link-local addresses
+ * (127.0.0.0/8, ::1, 169.254.0.0/16, fe80::/10), so those are refused by the
+ * proxy rather than connected to directly; it is set explicitly rather than
+ * left to Playwright's default.
+ */
+export function browserLaunchOptions(proxyServer: string): LaunchOptions {
+  return {
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    proxy: { server: proxyServer, bypass: "<-loopback>" },
+  };
+}
 
 /** Get or create the shared Playwright browser instance */
 async function getBrowser(): Promise<Browser> {
   if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    });
+    const proxy = await getEgressProxy();
+    browser = await chromium.launch(browserLaunchOptions(proxy.url));
   }
   return browser;
 }
@@ -34,12 +63,13 @@ export async function createPage(options?: {
   const blockMedia = options?.blockMedia !== false;
 
   // Registered UNCONDITIONALLY (screenshots pass blockMedia:false, which
-  // previously meant no interceptor at all): every request the browser makes
-  // — the main navigation, redirects, and subresources — is SSRF-checked, so
-  // a redirect to http://169.254.169.254 or an <img src> pointing at an
-  // internal host is aborted rather than fetched. Media is additionally
-  // dropped here when blockMedia is set. A per-page cache keeps a busy page
-  // from re-resolving the same host on every asset.
+  // previously meant no interceptor at all): requests this handler sees — the
+  // main navigation and subresources — are SSRF-checked so an <img src>
+  // pointing at an internal host fails fast. Playwright does NOT call route
+  // handlers for redirect hops, so this is not the enforcement point for
+  // redirects: the egress proxy (browserLaunchOptions) is. Media is
+  // additionally dropped here when blockMedia is set. A per-page cache keeps a
+  // busy page from re-resolving the same host on every asset.
   const safeHostCache = new Map<string, Promise<boolean>>();
   await page.route("**/*", async (route) => {
     const request = route.request();
@@ -68,7 +98,7 @@ export async function createPage(options?: {
 /** Navigate to URL and wait for content to settle */
 export async function navigateTo(page: Page, url: string): Promise<void> {
   // Fail fast with a clear error before the browser touches the network. The
-  // route interceptor (createPage) is the backstop for redirects/subresources.
+  // egress proxy re-checks every connection, including each redirect hop.
   await assertUrlSafe(url);
   await page.goto(url, { waitUntil: "networkidle", timeout: config.browser.timeout });
 }

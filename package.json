@@ -17,7 +17,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/lib/ssrf.test.ts"
+    "test": "tsx --test src/lib/ssrf.test.ts src/lib/egress-proxy.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.5",

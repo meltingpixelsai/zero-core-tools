@@ -1,6 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __setResolverForTests, assertUrlSafe, isBlockedIp, isUrlSafe, SsrfError } from "./ssrf.js";
+import { networkInterfaces } from "node:os";
+import {
+  __setInterfaceAddressesForTests,
+  __setResolverForTests,
+  assertUrlSafe,
+  isBlockedIp,
+  isOwnAddress,
+  isUrlSafe,
+  resolvePublicAddresses,
+  SsrfError,
+} from "./ssrf.js";
 
 // All cases here resolve locally (literal IPs, numeric encodings, localhost) —
 // the suite makes no outbound network call.
@@ -126,5 +136,70 @@ test("assertUrlSafe DNS loop: allows a host that resolves public, blocks one tha
     await assert.rejects(assertUrlSafe("https://scrape-target.example/"), SsrfError);
   } finally {
     __setResolverForTests(null);
+  }
+});
+
+// Stand-in for the server's interfaces: loopback plus public IPv4 and IPv6,
+// as on the VPS. 93.184.216.34, 151.101.1.69 (above 128.0.0.0, so its key
+// needs the unsigned shift) and 2a01:4ff:f0:1234::1 are ordinary public
+// addresses, so only the own-address rule can block them.
+const OWN = ["127.0.0.1", "::1", "93.184.216.34", "151.101.1.69", "2a01:4ff:f0:1234::1", "fe80::1"];
+
+test("isOwnAddress matches the server's own addresses in any spelling", () => {
+  try {
+    __setInterfaceAddressesForTests(() => OWN);
+    for (const ip of [
+      "93.184.216.34",
+      "::ffff:93.184.216.34", // IPv4-mapped, dotted
+      "::ffff:5db8:d822", // IPv4-mapped, hex (as new URL() writes it)
+      "151.101.1.69",
+      "::ffff:9765:145", // 151.101.1.69 mapped, hex
+      "2a01:4ff:f0:1234::1",
+      "2a01:04ff:00f0:1234:0:0:0:1", // expanded
+      "2A01:4FF:F0:1234::1", // upper case
+    ]) {
+      assert.equal(isOwnAddress(ip), true, `${ip} should match`);
+    }
+    for (const ip of ["93.184.216.35", "2a01:4ff:f0:1234::2", "8.8.8.8"]) {
+      assert.equal(isOwnAddress(ip), false, `${ip} should not match`);
+    }
+  } finally {
+    __setInterfaceAddressesForTests(null);
+  }
+});
+
+test("isOwnAddress recognizes every address the OS reports for this machine (no stub)", () => {
+  const reported = Object.values(networkInterfaces()).flatMap((list) => (list ?? []).map((a) => a.address));
+  assert.ok(reported.length > 0, "the OS reports at least the loopback addresses");
+  for (const ip of reported) {
+    assert.equal(isOwnAddress(ip), true, `${ip} should be recognized as this machine's`);
+  }
+});
+
+test("assertUrlSafe and resolvePublicAddresses refuse the server's own public addresses", async () => {
+  try {
+    __setInterfaceAddressesForTests(() => OWN);
+    for (const url of [
+      "http://93.184.216.34:4000/", // literal IPv4, any port
+      "https://93.184.216.34/",
+      "http://[2a01:4ff:f0:1234::1]:3000/", // literal IPv6
+      "http://[::ffff:93.184.216.34]:8403/", // IPv4-mapped
+    ]) {
+      await assert.rejects(assertUrlSafe(url), SsrfError, url);
+      assert.equal(await isUrlSafe(url), false, url);
+    }
+
+    // A hostname resolving to one of them (a site hosted on this server, or an
+    // attacker's DNS record pointing at it) is refused as well.
+    __setResolverForTests(async () => [{ address: "93.184.216.34" }]);
+    await assert.rejects(assertUrlSafe("https://self.example/"), SsrfError);
+    await assert.rejects(resolvePublicAddresses("self.example"), SsrfError);
+
+    // Negative control: a neighbouring public address still passes.
+    __setResolverForTests(async () => [{ address: "93.184.216.35" }]);
+    assert.deepEqual(await resolvePublicAddresses("other.example"), ["93.184.216.35"]);
+  } finally {
+    __setResolverForTests(null);
+    __setInterfaceAddressesForTests(null);
   }
 });
