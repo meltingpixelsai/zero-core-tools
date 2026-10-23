@@ -13,6 +13,7 @@ import { analyzeSentiment } from "./tools/sentiment.js";
 import { searchWeb } from "./tools/search.js";
 import { assertUrlSafe } from "./lib/ssrf.js";
 import { createSettleFirstPaidTools, type SettleFirstConfig } from "./lib/x402-settle-first.js";
+import { mcpRequestProblem } from "./lib/request-guard.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -300,15 +301,13 @@ app.get("/", (c) => c.html(landingHtml()));
 app.get("/dev", (c) => c.html(devHtml()));
 
 // MCP handler — x402 only (no API key auth needed)
-// mcp-handler parses POST bodies outside a try, so a malformed body would reject
-// unhandled and stop the process. Answer it with a JSON-RPC parse error instead.
+// Requests mcp-handler would throw on in a promise nobody awaits (a body that is
+// not JSON, or JSON too deep to re-serialize) or never answer (PUT, PATCH, HEAD)
+// get a JSON-RPC error here instead. See src/lib/request-guard.ts.
 app.all("*", async (c) => {
-  if (c.req.method === "POST") {
-    try {
-      JSON.parse(await c.req.raw.clone().text());
-    } catch {
-      return c.json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null }, 400);
-    }
+  const problem = mcpRequestProblem(c.req.method, c.req.method === "POST" ? await c.req.raw.clone().text() : null);
+  if (problem) {
+    return c.json({ jsonrpc: "2.0", error: { code: problem.code, message: problem.message }, id: null }, problem.status);
   }
   return paidHandler(c.req.raw);
 });
