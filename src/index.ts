@@ -120,7 +120,12 @@ async function urlPrecheck({ url }: { url: string }): Promise<string | null> {
   }
 }
 
-const paidHandler = createMcpPaidHandler(
+// mcp-handler serves all clients through one transport that knows a request
+// only by its JSON-RPC id, and every client numbers its requests from the
+// start, so two clients' calls with the same id could get each other's answers,
+// a paid result included. Each request therefore gets its own handler, with its
+// own server and transport; building one registers the tools (milliseconds).
+const createPaidHandler = () => createMcpPaidHandler(
   (server) => {
     registerFreeTools(server);
     const paidTool = settleFirst(server);
@@ -323,7 +328,7 @@ app.all("*", async (c) => {
     if (problem.status === 405) c.header("Allow", MCP_ALLOWED_METHODS);
     return c.json({ jsonrpc: "2.0", error: { code: problem.code, message: problem.message }, id: null }, problem.status);
   }
-  return paidHandler(c.req.raw);
+  return createPaidHandler()(c.req.raw);
 });
 
 // ── Start ────────────────────────────────────────────────────
