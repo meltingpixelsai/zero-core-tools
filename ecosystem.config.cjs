@@ -4,7 +4,9 @@ module.exports = {
       name: "harvey-tools",
       script: "dist/index.js",
       cwd: "/home/deploy/projects/harvey-tools",
-      node_args: "--enable-source-maps",
+      // V8 heap cap well under max_memory_restart (512M): under a burst of requests V8 otherwise lets the
+      // heap grow past the limit before it collects, and the process manager restarts the server (and drains).
+      node_args: "--enable-source-maps --max-old-space-size=320",
       env: {
         NODE_ENV: "production",
         PORT: 8403,
