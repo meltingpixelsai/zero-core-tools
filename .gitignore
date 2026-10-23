@@ -5,3 +5,6 @@ mcp-publisher.exe
 
 # MCP registry publisher credentials (mcp-publisher login) - never commit or publish
 .mcpregistry_*
+
+# x402 settle-first payment claims (runtime state)
+.x402-claims*
