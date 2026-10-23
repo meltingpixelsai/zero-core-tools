@@ -13,7 +13,7 @@ module.exports = {
       // Longer than the 90 s shutdown grace plus the 3 s browser close
       // (src/lib/graceful-shutdown.ts), so a stop or restart lets paid calls in
       // flight finish instead of killing them at 1.6 s.
-      kill_timeout: 95000,
+      kill_timeout: 100000,
       // Signal only the server, not its Chromium children: the server drains its
       // calls in flight, then closes the browser itself.
       treekill: false,
