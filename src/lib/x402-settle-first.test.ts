@@ -8,6 +8,7 @@ import {
   address,
   appendTransactionMessageInstructions,
   blockhash,
+  createNoopSigner,
   createTransactionMessage,
   generateKeyPairSigner,
   getBase64EncodedWireTransaction,
@@ -17,7 +18,8 @@ import {
   setTransactionMessageLifetimeUsingBlockhash,
 } from "@solana/kit";
 import { getSetComputeUnitLimitInstruction, getSetComputeUnitPriceInstruction } from "@solana-program/compute-budget";
-import { getTransferCheckedInstruction, TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
+import { getCreateAssociatedTokenInstruction, getTransferCheckedInstruction, TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
+import { TOKEN_2022_PROGRAM_ADDRESS } from "@solana-program/token-2022";
 import { decodePayment, encodePayment } from "x402/schemes";
 import type { SettleResponse, VerifyResponse } from "x402/types";
 import {
@@ -80,6 +82,8 @@ const TOKEN_PROGRAM = b58decode("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 interface TxShape {
   payer?: string;
+  feePayerSeed?: string;
+  authorityIndex?: number;
   transfers?: number;
   authorityIsSigner?: boolean;
   program?: Buffer;
@@ -94,9 +98,9 @@ interface TxShape {
 function txBase64(seed: string, slotFill = 0, shape: TxShape = {}): string {
   const payer = shape.payer ?? "payer-wallet";
   const signers = shape.authorityIsSigner === false ? 1 : 2;
-  const keys = [key32("fee-payer"), key32(payer), key32(`source-${payer}`), key32("destination"), key32("mint"), shape.program ?? TOKEN_PROGRAM];
+  const keys = [key32(shape.feePayerSeed ?? "fee-payer"), key32(payer), key32(`source-${payer}`), key32("destination"), key32("mint"), shape.program ?? TOKEN_PROGRAM];
   const transferData = Buffer.concat([Buffer.from([12]), Buffer.alloc(8), Buffer.from([6])]);
-  const transfer = Buffer.concat([Buffer.from([5, 4, 2, 4, 3, 1, transferData.length]), transferData]);
+  const transfer = Buffer.concat([Buffer.from([5, 4, 2, 4, 3, shape.authorityIndex ?? 1, transferData.length]), transferData]);
   const transfers = Array.from({ length: shape.transfers ?? 1 }, () => transfer);
   const message = Buffer.concat([
     Buffer.from([0x80, signers, 0, 2, keys.length]),
@@ -140,7 +144,7 @@ function harness(opts: {
   const facilitator: FacilitatorClient = {
     supported: async () => {
       events.push("supported");
-      return { kinds: [{ scheme: "exact", network: "solana", extra: { feePayer: "FeePayer111111111111111111111111111111111111" } }] };
+      return { kinds: [{ scheme: "exact", network: "solana", extra: { feePayer: walletOf("fee-payer") } }] };
     },
     verify: async () => {
       events.push("verify");
@@ -482,4 +486,53 @@ test("a payment built with @solana/kit the way x402's client builds it yields th
   const h = harness();
   assert.equal((await h.handler({}, paid(tok))).isError, undefined);
   assert.equal((h.extras[0] as { x402Settlement: X402Settlement }).x402Settlement.payer, client.address);
+});
+
+test("a transfer authorized by the fee payer is refused unpaid", async () => {
+  const h = harness();
+  // The fee payer slot (account 0) as authority, e.g. after the attacker approves it as delegate.
+  assert.equal(authorityOf(txBase64("y", 0, { authorityIndex: 0 })), null);
+  assert.equal(errorCode(await h.handler({}, paid(token("pay-18", 0, { authorityIndex: 0 })))), "INVALID_PAYMENT");
+  // The facilitator's published fee payer as authority at a later signer index.
+  const sneaky = { payer: "fee-payer", feePayerSeed: "attacker-fee-payer" };
+  assert.equal(authorityOf(txBase64("z", 0, sneaky)), walletOf("fee-payer"));
+  assert.equal(errorCode(await h.handler({}, paid(token("pay-19", 0, sneaky)))), "INVALID_PAYMENT");
+  assert.deepEqual(paymentEvents(h.events), []);
+});
+
+test("a Token-2022 payment with a create-ATA instruction, built with @solana/kit, yields the client's wallet", async () => {
+  const client = await generateKeyPairSigner();
+  const feePayer = (await generateKeyPairSigner()).address;
+  const source = (await generateKeyPairSigner()).address;
+  const destination = (await generateKeyPairSigner()).address;
+  const owner = (await generateKeyPairSigner()).address;
+  const mint = (await generateKeyPairSigner()).address;
+  const recentBlockhash = blockhash((await generateKeyPairSigner()).address);
+  const message = pipe(
+    createTransactionMessage({ version: 0 }),
+    (tx) => setTransactionMessageFeePayer(feePayer, tx),
+    (tx) => setTransactionMessageLifetimeUsingBlockhash({ blockhash: recentBlockhash, lastValidBlockHeight: 1000n }, tx),
+    (tx) =>
+      appendTransactionMessageInstructions(
+        [
+          getSetComputeUnitLimitInstruction({ units: 30000 }),
+          getSetComputeUnitPriceInstruction({ microLamports: 1 }),
+          getCreateAssociatedTokenInstruction({
+            payer: createNoopSigner(feePayer),
+            ata: destination,
+            owner,
+            mint,
+            tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
+          }),
+          getTransferCheckedInstruction(
+            { source, mint, destination, authority: client, amount: 2000n, decimals: 6 },
+            { programAddress: TOKEN_2022_PROGRAM_ADDRESS },
+          ),
+        ],
+        tx,
+      ),
+  );
+  const wire = getBase64EncodedWireTransaction(await partiallySignTransactionMessageWithSigners(message));
+  const tok = encodePayment({ x402Version: 1, scheme: "exact", network: "solana", payload: { transaction: wire } });
+  assert.equal(paymentAuthority(decodePayment(tok)), client.address);
 });

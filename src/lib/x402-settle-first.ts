@@ -240,7 +240,9 @@ function base58(bytes: Uint8Array): string {
  * TransferChecked, read from the signed transaction. The facilitator's reply
  * is not used for this, because x402's reference facilitator reports its own
  * fee payer as "payer". Returns null unless the message (legacy or v0) has
- * exactly one TransferChecked and its authority is a signer.
+ * exactly one TransferChecked and its authority is a signer other than the
+ * fee payer (account 0): the facilitator signs as fee payer for anyone, so a
+ * transfer it "authorizes" (as an approved delegate) proves no one's wallet.
  */
 export function paymentAuthority(payment: PaymentPayload): string | null {
   const msg = wireMessage((payment.payload as { transaction?: unknown }).transaction);
@@ -281,7 +283,7 @@ export function paymentAuthority(payment: PaymentPayload): string | null {
     if (accountIndexes.length < 4) return null;
     authority = accountIndexes[3];
   }
-  if (transfers !== 1 || authority < 0 || authority >= signerCount || authority >= keys.value) return null;
+  if (transfers !== 1 || authority <= 0 || authority >= signerCount || authority >= keys.value) return null;
   return base58(key(authority));
 }
 
@@ -430,7 +432,9 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         if (!selected) return paymentRequired("UNABLE_TO_MATCH_PAYMENT_REQUIREMENTS");
         const key = paymentClaimKey(decoded);
         const payer = paymentAuthority(decoded);
-        if (!key || !payer) return paymentRequired("INVALID_PAYMENT");
+        // The facilitator's published fee payer signs whatever it is asked to, so it is never a payer identity.
+        const feePayer = (selected.extra as { feePayer?: unknown } | undefined)?.feePayer;
+        if (!key || !payer || payer === feePayer) return paymentRequired("INVALID_PAYMENT");
 
         let claimed: boolean;
         try {
