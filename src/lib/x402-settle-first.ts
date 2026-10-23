@@ -52,7 +52,8 @@ export interface ToolResult {
 
 /** The settled payment, passed to the tool callback as `extra.x402Settlement`. */
 export interface X402Settlement {
-  payer?: string;
+  /** The wallet that signed the payment's token transfer, read from the transaction itself. */
+  payer: string;
   transaction: string;
   network: string;
 }
@@ -180,6 +181,29 @@ export class ClaimStore {
   }
 }
 
+/** Solana compact-u16 ("shortvec"): up to 3 bytes of 7 bits each. */
+function readShortVec(bytes: Uint8Array, offset: number): { value: number; next: number } | null {
+  let value = 0;
+  for (let i = 0; i < 3; i++) {
+    if (offset + i >= bytes.length) return null;
+    const byte = bytes[offset + i];
+    value |= (byte & 0x7f) << (7 * i);
+    if ((byte & 0x80) === 0) return { value, next: offset + i + 1 };
+  }
+  return null;
+}
+
+/** The message bytes of a base64 Solana wire transaction: everything after the signature section. */
+function wireMessage(transaction: unknown): Buffer | null {
+  if (typeof transaction !== "string") return null;
+  const bytes = Buffer.from(transaction, "base64");
+  const signatures = readShortVec(bytes, 0);
+  if (!signatures || signatures.value === 0) return null;
+  const messageStart = signatures.next + signatures.value * 64;
+  if (messageStart >= bytes.length) return null;
+  return bytes.subarray(messageStart);
+}
+
 /**
  * Claim key for an "exact" Solana payment: SHA-256 of the transaction message
  * (the bytes after the signature section). The payer's signature covers
@@ -187,22 +211,80 @@ export class ClaimStore {
  * same key. Returns null for anything else.
  */
 export function paymentClaimKey(payment: PaymentPayload): string | null {
-  const payload = payment.payload as { transaction?: unknown };
-  if (typeof payload.transaction !== "string") return null;
-  const bytes = Buffer.from(payload.transaction, "base64");
-  // Solana wire format: compact-u16 signature count, 64-byte signatures, then the message.
-  let count = 0;
-  let offset = 0;
-  for (let shift = 0; shift <= 14; shift += 7) {
-    if (offset >= bytes.length) return null;
-    const byte = bytes[offset++];
-    count |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) break;
-    if (shift === 14) return null;
+  const message = wireMessage((payment.payload as { transaction?: unknown }).transaction);
+  return message ? "svm-" + createHash("sha256").update(message).digest("hex") : null;
+}
+
+const TOKEN_PROGRAMS = new Set([
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
+]);
+const TRANSFER_CHECKED = 12;
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58(bytes: Uint8Array): string {
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
+  let n = 0n;
+  for (const byte of bytes) n = (n << 8n) | BigInt(byte);
+  let out = "";
+  while (n > 0n) {
+    out = BASE58[Number(n % 58n)] + out;
+    n /= 58n;
   }
-  const messageStart = offset + count * 64;
-  if (count === 0 || messageStart >= bytes.length) return null;
-  return "svm-" + createHash("sha256").update(bytes.subarray(messageStart)).digest("hex");
+  return "1".repeat(zeros) + out;
+}
+
+/**
+ * The paying wallet: the signer that authorizes the payment's one token
+ * TransferChecked, read from the signed transaction. The facilitator's reply
+ * is not used for this, because x402's reference facilitator reports its own
+ * fee payer as "payer". Returns null unless the message (legacy or v0) has
+ * exactly one TransferChecked and its authority is a signer other than the
+ * fee payer (account 0): the facilitator signs as fee payer for anyone, so a
+ * transfer it "authorizes" (as an approved delegate) proves no one's wallet.
+ */
+export function paymentAuthority(payment: PaymentPayload): string | null {
+  const msg = wireMessage((payment.payload as { transaction?: unknown }).transaction);
+  if (!msg) return null;
+  let o = 0;
+  if (msg[0] & 0x80) {
+    if ((msg[0] & 0x7f) !== 0) return null; // only version 0 of the versioned format
+    o = 1;
+  }
+  if (o + 3 > msg.length) return null;
+  const signerCount = msg[o];
+  o += 3;
+  const keys = readShortVec(msg, o);
+  if (!keys) return null;
+  const keysStart = keys.next;
+  o = keysStart + keys.value * 32 + 32; // static account keys, then the recent blockhash
+  if (o > msg.length) return null;
+  const key = (index: number) => msg.subarray(keysStart + index * 32, keysStart + (index + 1) * 32);
+  const instructions = readShortVec(msg, o);
+  if (!instructions) return null;
+  o = instructions.next;
+  let transfers = 0;
+  let authority = -1;
+  for (let i = 0; i < instructions.value; i++) {
+    if (o >= msg.length) return null;
+    const programIndex = msg[o++];
+    const accounts = readShortVec(msg, o);
+    if (!accounts) return null;
+    const accountIndexes = msg.subarray(accounts.next, accounts.next + accounts.value);
+    const data = readShortVec(msg, accounts.next + accounts.value);
+    if (!data) return null;
+    const dataBytes = msg.subarray(data.next, data.next + data.value);
+    o = data.next + data.value;
+    if (o > msg.length) return null;
+    if (programIndex >= keys.value || !TOKEN_PROGRAMS.has(base58(key(programIndex)))) continue;
+    if (dataBytes[0] !== TRANSFER_CHECKED) continue;
+    transfers++;
+    if (accountIndexes.length < 4) return null;
+    authority = accountIndexes[3];
+  }
+  if (transfers !== 1 || authority <= 0 || authority >= signerCount || authority >= keys.value) return null;
+  return base58(key(authority));
 }
 
 /** Read the payment token from MCP `_meta["x402/payment"]` or an X-PAYMENT header, as mcpay does. */
@@ -349,7 +431,10 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         const selected = findMatchingPaymentRequirements(accepts, decoded) as PaymentRequirements | undefined;
         if (!selected) return paymentRequired("UNABLE_TO_MATCH_PAYMENT_REQUIREMENTS");
         const key = paymentClaimKey(decoded);
-        if (!key) return paymentRequired("INVALID_PAYMENT");
+        const payer = paymentAuthority(decoded);
+        // The facilitator's published fee payer signs whatever it is asked to, so it is never a payer identity.
+        const feePayer = (selected.extra as { feePayer?: unknown } | undefined)?.feePayer;
+        if (!key || !payer || payer === feePayer) return paymentRequired("INVALID_PAYMENT");
 
         let claimed: boolean;
         try {
@@ -379,20 +464,20 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           settled = await facilitator.settle(decoded, selected);
         } catch (err) {
           claims.release(key);
-          log(`[x402] ${name}: settle request failed, tool not run: ${String(err)} payer=${verified.payer ?? "?"}`);
+          log(`[x402] ${name}: settle request failed, tool not run: ${String(err)} payer=${payer}`);
           return paymentRequired("SETTLEMENT_FAILED");
         }
         if (!settled.success) {
           claims.release(key);
           log(
-            `[x402] ${name}: settle failed, tool not run: reason=${settled.errorReason ?? "?"} tx=${settled.transaction || "-"} payer=${settled.payer ?? verified.payer ?? "?"}`,
+            `[x402] ${name}: settle failed, tool not run: reason=${settled.errorReason ?? "?"} tx=${settled.transaction || "-"} payer=${payer}`,
           );
           return paymentRequired(settled.errorReason ?? "SETTLEMENT_FAILED");
         }
         claims.markSettled(key, settled.transaction);
 
         const settlement: X402Settlement = {
-          payer: settled.payer ?? verified.payer,
+          payer,
           transaction: settled.transaction,
           network: settled.network,
         };
@@ -410,7 +495,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         }
         result._meta = { ...(result._meta ?? {}), "x402/payment-response": { success: true, ...settlement } };
         if (failed) {
-          log(`[x402] ${name}: failed after settlement (paid) payer=${settlement.payer ?? "?"} tx=${settlement.transaction}`);
+          log(`[x402] ${name}: failed after settlement (paid) payer=${payer} tx=${settlement.transaction}`);
         }
         return result;
       });
