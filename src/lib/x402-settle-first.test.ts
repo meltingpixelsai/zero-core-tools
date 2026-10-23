@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -21,6 +21,16 @@ const CONFIG: SettleFirstConfig = {
   recipient: { svm: { address: "Recipient11111111111111111111111111111111111", isTestnet: false } },
 };
 
+const tempDirs: string[] = [];
+function tempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "x402-claims-"));
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 /** A Solana wire transaction: 2 signature slots (fee payer, payer), then the message. */
 function txBase64(message: string, slotFill = 0): string {
   return Buffer.concat([Buffer.from([2]), Buffer.alloc(128, slotFill), Buffer.from(message)]).toString("base64");
@@ -39,20 +49,26 @@ interface Harness {
   events: string[];
   logs: string[];
   extras: unknown[];
+  claimsDir: string;
 }
 
 function harness(opts: {
   verify?: () => Promise<VerifyResponse>;
   settle?: () => Promise<SettleResponse>;
-  claimsFile?: string | null;
+  claimsDir?: string;
   toolResult?: () => Promise<ToolResult>;
   precheck?: (args: { x?: string }) => string | null;
+  events?: string[];
 } = {}): Harness {
-  const events: string[] = [];
+  const events: string[] = opts.events ?? [];
   const logs: string[] = [];
   const extras: unknown[] = [];
+  const claimsDir = opts.claimsDir ?? tempDir();
   const facilitator: FacilitatorClient = {
-    supported: async () => ({ kinds: [{ scheme: "exact", network: "solana", extra: { feePayer: "FeePayer111111111111111111111111111111111111" } }] }),
+    supported: async () => {
+      events.push("supported");
+      return { kinds: [{ scheme: "exact", network: "solana", extra: { feePayer: "FeePayer111111111111111111111111111111111111" } }] };
+    },
     verify: async () => {
       events.push("verify");
       return opts.verify ? opts.verify() : { isValid: true, payer: "Payer1111" };
@@ -64,7 +80,7 @@ function harness(opts: {
   };
   const settleFirst = createSettleFirstPaidTools(CONFIG, {
     facilitator,
-    claimsFile: opts.claimsFile ?? null,
+    claimsDir,
     log: (line) => logs.push(line),
   });
   const tools = new Map<string, Handler>();
@@ -88,12 +104,14 @@ function harness(opts: {
   );
   const handler = tools.get("echo");
   assert.ok(handler, "tool registered");
-  return { handler, events, logs, extras };
+  return { handler, events, logs, extras, claimsDir };
 }
 
 function errorCode(result: ToolResult): unknown {
   return (result._meta?.["x402/error"] as { error?: unknown } | undefined)?.error;
 }
+
+const paymentEvents = (events: string[]) => events.filter((e) => e !== "supported");
 
 test("no payment token: payment required, nothing runs", async () => {
   const h = harness();
@@ -104,14 +122,14 @@ test("no payment token: payment required, nothing runs", async () => {
   assert.equal(accepts.length, 1);
   assert.equal(accepts[0].network, "solana");
   assert.equal(accepts[0].payTo, CONFIG.recipient.svm.address);
-  assert.deepEqual(h.events, []);
+  assert.deepEqual(paymentEvents(h.events), []);
 });
 
 test("the payment settles before the tool runs, and the tool sees the settlement", async () => {
   const h = harness();
   const result = await h.handler({}, paid(token("pay-1")));
   assert.equal(result.isError, undefined);
-  assert.deepEqual(h.events, ["verify", "settle", "tool"]);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "tool"]);
   const response = result._meta?.["x402/payment-response"] as X402Settlement & { success: boolean };
   assert.equal(response.success, true);
   assert.equal(response.transaction, "sig-1");
@@ -119,21 +137,22 @@ test("the payment settles before the tool runs, and the tool sees the settlement
   assert.equal(settlement.payer, "Payer1111");
 });
 
-test("a payment that does not settle never runs the tool, and can be retried", async () => {
+test("a payment that does not settle never runs the tool, is logged, and can be retried", async () => {
   let attempt = 0;
   const h = harness({
     settle: async () =>
       ++attempt === 1
-        ? { success: false, errorReason: "insufficient_funds", transaction: "", network: "solana" }
+        ? { success: false, errorReason: "settle_exact_svm_transaction_confirmation_timed_out", transaction: "sig-maybe", network: "solana" }
         : { success: true, transaction: "sig-2", network: "solana", payer: "Payer1111" },
   });
   const tok = token("pay-2");
   const first = await h.handler({}, paid(tok));
-  assert.equal(errorCode(first), "insufficient_funds");
-  assert.deepEqual(h.events, ["verify", "settle"]);
+  assert.equal(errorCode(first), "settle_exact_svm_transaction_confirmation_timed_out");
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle"]);
+  assert.ok(h.logs.some((l) => l.includes("settle failed") && l.includes("confirmation_timed_out") && l.includes("sig-maybe")));
   const second = await h.handler({}, paid(tok));
   assert.equal(second.isError, undefined);
-  assert.deepEqual(h.events, ["verify", "settle", "verify", "settle", "tool"]);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "verify", "settle", "tool"]);
 });
 
 test("a settle request that throws does not run the tool and releases the claim", async () => {
@@ -152,11 +171,13 @@ test("a settle request that throws does not run the tool and releases the claim"
   assert.equal(h.events.filter((e) => e === "tool").length, 1);
 });
 
-test("an invalid payment is refused before settle", async () => {
+test("an invalid payment is refused before settle, and the fee-payer cache is refreshed", async () => {
   const h = harness({ verify: async () => ({ isValid: false, invalidReason: "invalid_exact_svm_payload_transaction" }) });
   const result = await h.handler({}, paid(token("pay-4")));
   assert.equal(errorCode(result), "invalid_exact_svm_payload_transaction");
-  assert.deepEqual(h.events, ["verify"]);
+  assert.deepEqual(paymentEvents(h.events), ["verify"]);
+  await h.handler({}, paid(token("pay-4b")));
+  assert.equal(h.events.filter((e) => e === "supported").length, 2, "supported() asked again after a failed verify");
 });
 
 test("one payment sent five times in parallel runs the tool once", async () => {
@@ -180,17 +201,39 @@ test("one payment sent five times in parallel runs the tool once", async () => {
   assert.equal(results.filter((r) => errorCode(r) === "PAYMENT_ALREADY_USED").length, 4);
 });
 
+test("one payment sent to two servers sharing the claim directory runs one tool", async () => {
+  const claimsDir = tempDir();
+  const events: string[] = [];
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const settle = async (): Promise<SettleResponse> => {
+    await gate;
+    return { success: true, transaction: "sig-6", network: "solana", payer: "Payer1111" };
+  };
+  const serverA = harness({ claimsDir, events, settle });
+  const serverB = harness({ claimsDir, events, settle });
+  const tok = token("pay-6");
+  const pending = [serverA.handler({}, paid(tok)), serverB.handler({}, paid(tok))];
+  await new Promise((resolve) => setImmediate(resolve));
+  release();
+  const results = await Promise.all(pending);
+  assert.equal(events.filter((e) => e === "tool").length, 1);
+  assert.equal(results.filter((r) => errorCode(r) === "PAYMENT_ALREADY_USED").length, 1);
+});
+
 test("a settled payment cannot be replayed", async () => {
   const h = harness();
-  const tok = token("pay-6");
+  const tok = token("pay-7");
   assert.equal((await h.handler({}, paid(tok))).isError, undefined);
   assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
   assert.equal(h.events.filter((e) => e === "tool").length, 1);
 });
 
 test("re-encoding a payment with different empty signature slots shares its claim", async () => {
-  const a = token("pay-7", 0);
-  const b = token("pay-7", 9);
+  const a = token("pay-8", 0);
+  const b = token("pay-8", 9);
   assert.notEqual(a, b);
   const h = harness();
   assert.equal((await h.handler({}, paid(a))).isError, undefined);
@@ -199,48 +242,41 @@ test("re-encoding a payment with different empty signature slots shares its clai
 
 test("different payments are independent", async () => {
   const h = harness();
-  assert.equal((await h.handler({}, paid(token("pay-8a")))).isError, undefined);
-  assert.equal((await h.handler({}, paid(token("pay-8b")))).isError, undefined);
+  assert.equal((await h.handler({}, paid(token("pay-9a")))).isError, undefined);
+  assert.equal((await h.handler({}, paid(token("pay-9b")))).isError, undefined);
   assert.equal(h.events.filter((e) => e === "tool").length, 2);
 });
 
-test("settled claims survive a restart", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "x402-claims-"));
-  const claimsFile = path.join(dir, "claims.jsonl");
-  try {
-    const tok = token("pay-9");
-    const first = harness({ claimsFile });
-    assert.equal((await first.handler({}, paid(tok))).isError, undefined);
-    const restarted = harness({ claimsFile });
-    assert.equal(errorCode(await restarted.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
-    assert.deepEqual(restarted.events, []);
-    const fresh = await restarted.handler({}, paid(token("pay-9b")));
-    assert.equal(fresh.isError, undefined);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+test("settled claims survive a restart; released ones do not block", async () => {
+  const claimsDir = tempDir();
+  const settledTok = token("pay-10");
+  const first = harness({ claimsDir });
+  assert.equal((await first.handler({}, paid(settledTok))).isError, undefined);
+  const failedTok = token("pay-10b");
+  const failing = harness({
+    claimsDir,
+    settle: async () => ({ success: false, errorReason: "insufficient_funds", transaction: "", network: "solana" }),
+  });
+  assert.equal(errorCode(await failing.handler({}, paid(failedTok))), "insufficient_funds");
+  const restarted = harness({ claimsDir });
+  assert.equal(errorCode(await restarted.handler({}, paid(settledTok))), "PAYMENT_ALREADY_USED");
+  assert.equal((await restarted.handler({}, paid(failedTok))).isError, undefined);
+  const claimFiles = fs.readdirSync(claimsDir).filter((n) => n.endsWith(".claim"));
+  assert.equal(claimFiles.length, 2);
 });
 
-test("a released claim is not restored after a restart", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "x402-claims-"));
-  const claimsFile = path.join(dir, "claims.jsonl");
-  try {
-    const tok = token("pay-10");
-    const first = harness({
-      claimsFile,
-      settle: async () => ({ success: false, errorReason: "insufficient_funds", transaction: "", network: "solana" }),
-    });
-    assert.equal(errorCode(await first.handler({}, paid(tok))), "insufficient_funds");
-    const restarted = harness({ claimsFile });
-    assert.equal((await restarted.handler({}, paid(tok))).isError, undefined);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+test("an unwritable claim store refuses the payment before any facilitator call", async () => {
+  const h = harness();
+  fs.rmSync(h.claimsDir, { recursive: true, force: true });
+  const result = await h.handler({}, paid(token("pay-11")));
+  assert.equal(errorCode(result), "PAYMENT_CLAIM_UNAVAILABLE");
+  assert.deepEqual(paymentEvents(h.events), []);
+  assert.ok(h.logs.some((l) => l.includes("claim store unavailable")));
 });
 
 test("a tool that fails after settlement is reported as paid and logged", async () => {
   const h = harness({ toolResult: async () => ({ isError: true, content: [{ type: "text", text: "Error: upstream down" }] }) });
-  const result = await h.handler({}, paid(token("pay-11")));
+  const result = await h.handler({}, paid(token("pay-12")));
   assert.equal(result.isError, true);
   const response = result._meta?.["x402/payment-response"] as { success: boolean; transaction: string };
   assert.equal(response.success, true);
@@ -254,22 +290,23 @@ test("a tool that throws after settlement is reported as paid", async () => {
       throw new Error("boom");
     },
   });
-  const result = await h.handler({}, paid(token("pay-12")));
+  const result = await h.handler({}, paid(token("pay-13")));
   assert.equal(result.isError, true);
   assert.match(result.content[0].text ?? "", /Tool execution failed: Error: boom/);
   assert.ok(result._meta?.["x402/payment-response"]);
 });
 
-test("a precheck refusal takes no payment and leaves the payment usable", async () => {
+test("a precheck refusal comes before any payment is asked for or taken", async () => {
   const h = harness({ precheck: (args) => (args.x === "bad" ? "url not allowed" : null) });
-  const tok = token("pay-13");
+  const unpaid = await h.handler({ x: "bad" }, {});
+  assert.equal(unpaid.content[0].text, "Error: url not allowed");
+  assert.equal(unpaid._meta, undefined);
+  const tok = token("pay-14");
   const refused = await h.handler({ x: "bad" }, paid(tok));
-  assert.equal(refused.isError, true);
   assert.equal(refused.content[0].text, "Error: url not allowed");
-  assert.equal(refused._meta, undefined);
   assert.deepEqual(h.events, []);
   assert.equal((await h.handler({ x: "good" }, paid(tok))).isError, undefined);
-  assert.deepEqual(h.events, ["verify", "settle", "tool"]);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "tool"]);
 });
 
 test("a transaction without a message is refused before any facilitator call", async () => {
@@ -279,7 +316,7 @@ test("a transaction without a message is refused before any facilitator call", a
   const truncated = encodePayment({ x402Version: 1, scheme: "exact", network: "solana", payload: { transaction: Buffer.concat([Buffer.from([2]), Buffer.alloc(100)]).toString("base64") } });
   assert.equal(errorCode(await h.handler({}, paid(truncated))), "INVALID_PAYMENT");
   assert.equal(errorCode(await h.handler({}, paid("not-a-payment"))), "INVALID_PAYMENT");
-  assert.deepEqual(h.events, []);
+  assert.deepEqual(paymentEvents(h.events), []);
 });
 
 test("the claim key ignores signature slots and covers the message", () => {
@@ -287,12 +324,12 @@ test("the claim key ignores signature slots and covers the message", () => {
     paymentClaimKey({ x402Version: 1, scheme: "exact", network: "solana", payload: { transaction: tx } });
   assert.equal(key(txBase64("m", 0)), key(txBase64("m", 5)));
   assert.notEqual(key(txBase64("m")), key(txBase64("n")));
-  assert.match(key(txBase64("m")) ?? "", /^svm:[0-9a-f]{64}$/);
+  assert.match(key(txBase64("m")) ?? "", /^svm-[0-9a-f]{64}$/);
 });
 
 test("only an svm recipient is accepted", () => {
   assert.throws(
-    () => createSettleFirstPaidTools({ ...CONFIG, recipient: {} as unknown as SettleFirstConfig["recipient"] }, { claimsFile: null }),
+    () => createSettleFirstPaidTools({ ...CONFIG, recipient: {} as unknown as SettleFirstConfig["recipient"] }, { claimsDir: tempDir() }),
     /only an svm recipient/,
   );
 });

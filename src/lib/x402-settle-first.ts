@@ -14,15 +14,19 @@
  *   3. settle it;
  *   4. only then run the tool.
  * A payment that fails to settle releases its claim and never runs the tool.
- * A settled payment keeps its claim for 24 hours, on disk, so a replay after a
- * restart is refused too. A tool that fails after settlement has been paid
- * for: the result says so (x402/payment-response) and the server logs it.
+ * Claims are marker files in one directory shared by every server that takes
+ * the same wallet's payments (default ~/.x402-claims), so one payment sent to
+ * several servers at once runs one tool, and a replay after a restart is
+ * refused. A settled claim is kept for 24 hours. A tool that fails after
+ * settlement has been paid for: the result says so (x402/payment-response) and
+ * the server logs it.
  *
  * Requirement building and payment-token parsing follow mcpay 0.1.17
  * (MIT License, Copyright (c) MCPay). Solana ("svm") recipients only.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { decodePayment } from "x402/schemes";
 import { findMatchingPaymentRequirements, processPriceToAtomicAmount } from "x402/shared";
@@ -63,113 +67,99 @@ export interface FacilitatorClient {
 type ToolRegistrar = { tool: (...args: unknown[]) => unknown };
 
 export interface PaidToolOptions<A> {
-  /** Cheap input checks that run before any payment is taken. Return a message to refuse the call unpaid. */
+  /** Cheap input checks that run before any payment is asked for or taken. Return a message to refuse the call. */
   precheck?: (args: A) => Promise<string | null> | string | null;
 }
 
 export interface SettleFirstDeps {
   facilitator?: FacilitatorClient;
-  /** Claim file path; null keeps claims in memory only. Default: X402_CLAIMS_FILE or ./.x402-claims.jsonl */
-  claimsFile?: string | null;
+  /** Claim directory shared by every server paid to the same wallet. Default: X402_CLAIMS_DIR or ~/.x402-claims */
+  claimsDir?: string;
   now?: () => number;
   log?: (line: string) => void;
 }
 
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
+const PRUNE_EVERY_MS = 10 * 60 * 1000;
 const FEE_PAYER_TTL_MS = 10 * 60 * 1000;
 
-type ClaimState = "pending" | "settled";
-
-/** Single-use payment claims: in memory, mirrored to an append-only JSONL file. */
+/**
+ * Single-use payment claims: one marker file per payment, created with O_EXCL,
+ * so the claim is atomic across every process that shares the directory.
+ */
 export class ClaimStore {
-  private readonly claims = new Map<string, { state: ClaimState; at: number }>();
-  private writesSinceCompact = 0;
+  private lastPrune = 0;
 
   constructor(
-    private readonly file: string | null,
+    private readonly dir: string,
     private readonly now: () => number,
     private readonly log: (line: string) => void,
   ) {
-    this.load();
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
-  /** Atomically take the claim; false when the payment is pending or already settled. */
+  private file(key: string): string {
+    return path.join(this.dir, key.replace(/[^A-Za-z0-9_-]/g, "_") + ".claim");
+  }
+
+  /** Take the claim; false when any process already holds it. Throws when the directory cannot be written. */
   tryClaim(key: string): boolean {
-    this.prune();
-    if (this.claims.has(key)) return false;
-    this.set(key, "pending");
+    this.pruneOccasionally();
+    let fd: number;
+    try {
+      fd = fs.openSync(this.file(key), "wx", 0o600);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
+    }
+    try {
+      fs.writeSync(fd, JSON.stringify({ s: "pending", t: this.now() }));
+    } finally {
+      fs.closeSync(fd);
+    }
     return true;
   }
 
-  markSettled(key: string): void {
-    this.set(key, "settled");
+  markSettled(key: string, transaction: string): void {
+    try {
+      fs.writeFileSync(this.file(key), JSON.stringify({ s: "settled", t: this.now(), tx: transaction }), { mode: 0o600 });
+    } catch (err) {
+      this.log(`[x402] could not mark claim settled (claim still held): ${String(err)}`);
+    }
   }
 
   release(key: string): void {
-    if (!this.claims.delete(key)) return;
-    this.append({ k: key, s: "released", t: this.now() });
+    try {
+      fs.unlinkSync(this.file(key));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.log(`[x402] could not release payment claim: ${String(err)}`);
+      }
+    }
   }
 
   has(key: string): boolean {
-    this.prune();
-    return this.claims.has(key);
+    return fs.existsSync(this.file(key));
   }
 
-  private set(key: string, state: ClaimState): void {
-    const at = this.now();
-    this.claims.set(key, { state, at });
-    this.append({ k: key, s: state, t: at });
-  }
-
-  private prune(): void {
-    const cutoff = this.now() - CLAIM_TTL_MS;
-    for (const [key, entry] of this.claims) {
-      if (entry.at < cutoff) this.claims.delete(key);
-    }
-  }
-
-  private load(): void {
-    if (!this.file || !fs.existsSync(this.file)) return;
-    const cutoff = this.now() - CLAIM_TTL_MS;
+  /** Delete claims older than 24 hours; their payments can no longer settle. */
+  private pruneOccasionally(): void {
+    const now = this.now();
+    if (now - this.lastPrune < PRUNE_EVERY_MS) return;
+    this.lastPrune = now;
     try {
-      for (const line of fs.readFileSync(this.file, "utf8").split("\n")) {
-        if (!line.trim()) continue;
-        let rec: { k?: unknown; s?: unknown; t?: unknown };
+      for (const name of fs.readdirSync(this.dir)) {
+        if (!name.endsWith(".claim")) continue;
+        const file = path.join(this.dir, name);
         try {
-          rec = JSON.parse(line) as { k?: unknown; s?: unknown; t?: unknown };
+          if (now - fs.statSync(file).mtimeMs > CLAIM_TTL_MS) fs.unlinkSync(file);
         } catch {
-          continue;
-        }
-        if (typeof rec.k !== "string" || typeof rec.t !== "number") continue;
-        if (rec.s === "released") this.claims.delete(rec.k);
-        else if (rec.t >= cutoff && (rec.s === "pending" || rec.s === "settled")) {
-          this.claims.set(rec.k, { state: rec.s, at: rec.t });
+          // Another process pruned or released it first.
         }
       }
-      this.compact();
     } catch (err) {
-      this.log(`[x402] could not load payment claims from ${this.file}: ${String(err)}`);
+      this.log(`[x402] could not prune payment claims: ${String(err)}`);
     }
-  }
-
-  private append(rec: { k: string; s: string; t: number }): void {
-    if (!this.file) return;
-    try {
-      fs.appendFileSync(this.file, JSON.stringify(rec) + "\n", { mode: 0o600 });
-      if (++this.writesSinceCompact >= 1000) this.compact();
-    } catch (err) {
-      this.log(`[x402] could not persist payment claim (kept in memory): ${String(err)}`);
-    }
-  }
-
-  private compact(): void {
-    if (!this.file) return;
-    this.prune();
-    const tmp = `${this.file}.tmp`;
-    const lines = [...this.claims].map(([k, v]) => JSON.stringify({ k, s: v.state, t: v.at }) + "\n").join("");
-    fs.writeFileSync(tmp, lines, { mode: 0o600 });
-    fs.renameSync(tmp, this.file);
-    this.writesSinceCompact = 0;
   }
 }
 
@@ -195,7 +185,7 @@ export function paymentClaimKey(payment: PaymentPayload): string | null {
   }
   const messageStart = offset + count * 64;
   if (count === 0 || messageStart >= bytes.length) return null;
-  return "svm:" + createHash("sha256").update(bytes.subarray(messageStart)).digest("hex");
+  return "svm-" + createHash("sha256").update(bytes.subarray(messageStart)).digest("hex");
 }
 
 /** Read the payment token from MCP `_meta["x402/payment"]` or an X-PAYMENT header, as mcpay does. */
@@ -238,11 +228,8 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((line: string) => console.warn(line));
   const facilitator: FacilitatorClient = deps.facilitator ?? (useFacilitator(cfg.facilitator) as FacilitatorClient);
-  const claimsFile =
-    deps.claimsFile === undefined
-      ? process.env.X402_CLAIMS_FILE || path.join(process.cwd(), ".x402-claims.jsonl")
-      : deps.claimsFile;
-  const claims = new ClaimStore(claimsFile, now, log);
+  const claimsDir = deps.claimsDir ?? (process.env.X402_CLAIMS_DIR || path.join(os.homedir(), ".x402-claims"));
+  const claims = new ClaimStore(claimsDir, now, log);
 
   let feePayerCache: { at: number; byNetwork: Map<string, string> } | null = null;
   async function feePayers(): Promise<Map<string, string>> {
@@ -316,6 +303,11 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
       options: PaidToolOptions<A> = {},
     ): unknown {
       return registrar.tool(name, description, paramsSchema, { ...annotations, ...annotationsFor(price) }, async (args: A, extra: unknown) => {
+        if (options.precheck) {
+          const problem = await options.precheck(args);
+          if (problem) return { isError: true, content: [{ type: "text", text: `Error: ${problem}` }] };
+        }
+
         const accepts = await buildRequirements(name, description, price);
         if (!accepts.length) return errorResult({ x402Version, error: "PRICE_COMPUTE_FAILED" });
         const paymentRequired = (reason = "PAYMENT_REQUIRED", fields: Record<string, unknown> = {}) =>
@@ -335,22 +327,26 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         const key = paymentClaimKey(decoded);
         if (!key) return paymentRequired("INVALID_PAYMENT");
 
-        if (options.precheck) {
-          const problem = await options.precheck(args);
-          if (problem) return { isError: true, content: [{ type: "text", text: `Error: ${problem}` }] };
+        let claimed: boolean;
+        try {
+          claimed = claims.tryClaim(key);
+        } catch (err) {
+          log(`[x402] ${name}: payment claim store unavailable, payment refused unpaid: ${String(err)}`);
+          return paymentRequired("PAYMENT_CLAIM_UNAVAILABLE");
         }
-
-        if (!claims.tryClaim(key)) return paymentRequired("PAYMENT_ALREADY_USED");
+        if (!claimed) return paymentRequired("PAYMENT_ALREADY_USED");
 
         let verified: VerifyResponse;
         try {
           verified = await facilitator.verify(decoded, selected);
         } catch {
           claims.release(key);
+          feePayerCache = null;
           return paymentRequired("VERIFY_FAILED");
         }
         if (!verified.isValid) {
           claims.release(key);
+          feePayerCache = null;
           return paymentRequired(verified.invalidReason ?? "INVALID_PAYMENT", { payer: verified.payer });
         }
 
@@ -359,14 +355,17 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           settled = await facilitator.settle(decoded, selected);
         } catch (err) {
           claims.release(key);
-          log(`[x402] ${name}: settle request failed, tool not run: ${String(err)}`);
+          log(`[x402] ${name}: settle request failed, tool not run: ${String(err)} payer=${verified.payer ?? "?"}`);
           return paymentRequired("SETTLEMENT_FAILED");
         }
         if (!settled.success) {
           claims.release(key);
+          log(
+            `[x402] ${name}: settle failed, tool not run: reason=${settled.errorReason ?? "?"} tx=${settled.transaction || "-"} payer=${settled.payer ?? verified.payer ?? "?"}`,
+          );
           return paymentRequired(settled.errorReason ?? "SETTLEMENT_FAILED");
         }
-        claims.markSettled(key);
+        claims.markSettled(key, settled.transaction);
 
         const settlement: X402Settlement = {
           payer: settled.payer ?? verified.payer,

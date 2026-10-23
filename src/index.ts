@@ -111,8 +111,8 @@ async function urlPrecheck({ url }: { url: string }): Promise<string | null> {
   try {
     await assertUrlSafe(url);
     return null;
-  } catch (err) {
-    return err instanceof Error ? err.message : String(err);
+  } catch {
+    return "URL not allowed: only public http(s) addresses can be fetched";
   }
 }
 
@@ -272,6 +272,9 @@ const paidHandler = createMcpPaidHandler(
   {
     maxDuration: 300,
     verboseLogs: process.env.NODE_ENV !== "production",
+    // No Redis here: without this, an anonymous GET /sse or POST /message
+    // throws "redisUrl is required" in an unawaited promise and kills the process.
+    disableSse: true,
   }
 );
 
