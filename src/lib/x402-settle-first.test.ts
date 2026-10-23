@@ -24,8 +24,10 @@ import { decodePayment, encodePayment } from "x402/schemes";
 import type { SettleResponse, VerifyResponse } from "x402/types";
 import {
   createSettleFirstPaidTools,
+  MAX_PAYMENT_TOKEN_LENGTH,
   paymentAuthority,
   paymentClaimKey,
+  paymentTokenAuthority,
   type FacilitatorClient,
   type SettleFirstConfig,
   type ToolResult,
@@ -535,4 +537,29 @@ test("a Token-2022 payment with a create-ATA instruction, built with @solana/kit
   const wire = getBase64EncodedWireTransaction(await partiallySignTransactionMessageWithSigners(message));
   const tok = encodePayment({ x402Version: 1, scheme: "exact", network: "solana", payload: { transaction: wire } });
   assert.equal(paymentAuthority(decodePayment(tok)), client.address);
+});
+
+test("a transaction longer than Solana allows is refused before any facilitator call", async () => {
+  const oversized = txBase64("big", 0, { transfers: 60 });
+  assert.ok(Buffer.from(oversized, "base64").length > 1232);
+  assert.equal(paymentClaimKey({ x402Version: 1, scheme: "exact", network: "solana", payload: { transaction: oversized } }), null);
+  assert.equal(authorityOf(oversized), null);
+  const h = harness();
+  assert.equal(errorCode(await h.handler({}, paid(token("pay-20", 0, { transfers: 60 })))), "INVALID_PAYMENT");
+  assert.deepEqual(paymentEvents(h.events), []);
+});
+
+test("a payment token longer than any real payment is refused before it is decoded", async () => {
+  const h = harness();
+  const huge = "A".repeat(MAX_PAYMENT_TOKEN_LENGTH + 1);
+  assert.equal(errorCode(await h.handler({}, paid(huge))), "INVALID_PAYMENT");
+  assert.equal(paymentTokenAuthority(huge), null);
+  assert.deepEqual(paymentEvents(h.events), []);
+  assert.ok(token("pay-21").length < MAX_PAYMENT_TOKEN_LENGTH / 2, "a real payment token is far below the limit");
+});
+
+test("paymentTokenAuthority names the signer of an unsettled token", () => {
+  assert.equal(paymentTokenAuthority(token("pay-22", 0, { payer: "wallet-c" })), walletOf("wallet-c"));
+  assert.equal(paymentTokenAuthority(token("pay-23", 0, { transfers: 2 })), null);
+  assert.equal(paymentTokenAuthority("not-a-payment"), null);
 });
