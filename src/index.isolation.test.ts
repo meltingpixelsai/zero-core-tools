@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -10,10 +10,9 @@ import path from "node:path";
 import { encodePayment } from "x402/schemes";
 
 // Starts the real server (src/index.ts through tsx) and sends two clients' requests with the same JSON-RPC id at
-// the same time: a paid call whose payment check a stand-in facilitator holds for 1.5 s, and a free tools/list.
-// mcp-handler's one shared transport routed answers by id alone, so the paid call's answer was lost and the call
-// never answered. Each must get its own answer. No real payment: the facilitator refuses it, and nothing leaves
-// 127.0.0.1.
+// the same time. mcp-handler's one shared transport routed answers by id alone, so a call's answer could be lost
+// (a paid call charged and never answered) or reach the other client. Each must get its own answer. No real
+// payment: a stand-in facilitator holds /verify for a while and then refuses, and nothing leaves 127.0.0.1.
 
 const ARGS: Record<string, Record<string, unknown>> = {
   analyze_sentiment: { text: "isolation test" },
@@ -60,7 +59,7 @@ function rpc(port: number, body: string, timeoutMs = 8000): Promise<string> {
 }
 
 // A transaction shaped like an x402 "exact" Solana payment: fee payer and paying wallet sign; one SPL Token
-// TransferChecked whose authority is the paying wallet. The facilitator stand-in refuses it.
+// TransferChecked whose authority is the paying wallet.
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58decode(text: string): Buffer {
   let n = 0n;
@@ -81,8 +80,13 @@ function paymentToken(seed: string): string {
   return encodePayment({ x402Version: 1, scheme: "exact", network: "solana", payload: { transaction } } as Parameters<typeof encodePayment>[0]);
 }
 
-test("two clients' requests with the same id each get their own answer", async (t) => {
+/**
+ * Starts a stand-in facilitator whose n-th /verify (0-based) waits holds[n] ms and then refuses with reasons[n],
+ * and the server pointed at it. Returns the server's port and the paid tool this server has.
+ */
+async function startServer(t: TestContext, holds: number[], reasons: string[]): Promise<{ port: number; paidCall: (seed: string) => string }> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zc-isolation-"));
+  let verifies = 0;
   const facilitator = http.createServer((req, res) => {
     req.resume();
     res.setHeader("content-type", "application/json");
@@ -90,7 +94,8 @@ test("two clients' requests with the same id each get their own answer", async (
       return res.end(JSON.stringify({ kinds: [{ x402Version: 1, scheme: "exact", network: "solana", extra: { feePayer: "FeePayer111111111111111111111111111111111111" } }] }));
     }
     if (req.url?.startsWith("/verify")) {
-      return setTimeout(() => res.end(JSON.stringify({ isValid: false, invalidReason: "insufficient_funds" })), 1500);
+      const n = Math.min(verifies++, holds.length - 1);
+      return setTimeout(() => res.end(JSON.stringify({ isValid: false, invalidReason: reasons[n] })), holds[n]);
     }
     res.statusCode = 404;
     res.end("{}");
@@ -122,20 +127,23 @@ test("two clients' requests with the same id each get their own answer", async (
     facilitator.close();
     fs.rmSync(tmp, { recursive: true, force: true });
   });
-
   const started = Date.now();
   while (!/running on port/i.test(out)) {
     assert.ok(Date.now() - started < 60_000, "the server did not start:\n" + out.slice(-600));
     assert.equal(child.exitCode, null, "the server exited at startup:\n" + out.slice(-600));
     await new Promise((r) => setTimeout(r, 200));
   }
-
   const listed = await rpc(port, JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" }));
   const tool = Object.keys(ARGS).find((name) => listed.includes(`"name":"${name}"`));
   assert.ok(tool, "no known paid tool in tools/list:\n" + listed.slice(0, 300));
+  const paidCall = (seed: string) =>
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: ARGS[tool], _meta: { "x402/payment": paymentToken(`${seed}-${Date.now()}`) } } });
+  return { port, paidCall };
+}
 
-  const paidCall = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: ARGS[tool], _meta: { "x402/payment": paymentToken(`isolation-${Date.now()}`) } } });
-  const paid = rpc(port, paidCall);
+test("a paid call held at the facilitator still gets its own answer when another client reuses its id", async (t) => {
+  const { port, paidCall } = await startServer(t, [1500], ["insufficient_funds"]);
+  const paid = rpc(port, paidCall("held"));
   await new Promise((r) => setTimeout(r, 400)); // the paid call now waits on the facilitator
   const free = await rpc(port, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
   const paidAnswer = await paid;
@@ -143,6 +151,21 @@ test("two clients' requests with the same id each get their own answer", async (
   assert.match(free, /"tools":\[/, "the free client did not get its tool list");
   assert.doesNotMatch(free, /x402\/error/, "the free client got the paid call's answer");
   assert.notEqual(paidAnswer, "no answer", "the paid call got no answer");
-  assert.match(paidAnswer, /x402\/error|"isError":true/, "the paid client did not get its own answer");
+  assert.match(paidAnswer, /insufficient_funds/, "the paid client did not get its own answer");
   assert.doesNotMatch(paidAnswer, /"tools":\[/, "the paid client got the free call's answer");
+});
+
+test("two paid calls with the same id each get their own answer, whichever finishes first", async (t) => {
+  // The first call's payment check is held 2 s, the second's 0.3 s, so the second finishes first.
+  const { port, paidCall } = await startServer(t, [2000, 300], ["first_call_refused", "second_call_refused"]);
+  const first = rpc(port, paidCall("first"));
+  await new Promise((r) => setTimeout(r, 400));
+  const second = await rpc(port, paidCall("second"));
+  const firstAnswer = await first;
+
+  assert.notEqual(second, "no answer", "the second call got no answer");
+  assert.match(second, /second_call_refused/, "the second client did not get its own answer");
+  assert.doesNotMatch(second, /first_call_refused/, "the second client got the first call's answer");
+  assert.notEqual(firstAnswer, "no answer", "the first call got no answer");
+  assert.match(firstAnswer, /first_call_refused/, "the first client did not get its own answer");
 });
