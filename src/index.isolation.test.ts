@@ -1,0 +1,171 @@
+import { test, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { encodePayment } from "x402/schemes";
+
+// Starts the real server (src/index.ts through tsx) and sends two clients' requests with the same JSON-RPC id at
+// the same time. mcp-handler's one shared transport routed answers by id alone, so a call's answer could be lost
+// (a paid call charged and never answered) or reach the other client. Each must get its own answer. No real
+// payment: a stand-in facilitator holds /verify for a while and then refuses, and nothing leaves 127.0.0.1.
+
+const ARGS: Record<string, Record<string, unknown>> = {
+  analyze_sentiment: { text: "isolation test" },
+  get_service_quality: { service_id: "isolation-test" },
+  get_spending_report: { agent_id: "isolation-test", period: "day" },
+};
+
+function freePort(): Promise<number> {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.listen(0, "127.0.0.1", () => {
+      const { port } = s.address() as net.AddressInfo;
+      s.close(() => resolve(port));
+    });
+  });
+}
+
+/** POST one JSON-RPC body to /mcp; the full response text, or "no answer" after `timeoutMs`. */
+function rpc(port: number, body: string, timeoutMs = 8000): Promise<string> {
+  return new Promise((resolve) => {
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        method: "POST",
+        path: "/mcp",
+        agent: false,
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      },
+      (res) => {
+        let text = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => (text += chunk));
+        res.on("end", () => resolve(text));
+      }
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      resolve("no answer");
+    });
+    req.on("error", () => resolve("no answer"));
+    req.end(body);
+  });
+}
+
+// A transaction shaped like an x402 "exact" Solana payment: fee payer and paying wallet sign; one SPL Token
+// TransferChecked whose authority is the paying wallet.
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function b58decode(text: string): Buffer {
+  let n = 0n;
+  for (const ch of text) n = n * 58n + BigInt(B58.indexOf(ch));
+  const out: number[] = [];
+  while (n > 0n) {
+    out.unshift(Number(n & 0xffn));
+    n >>= 8n;
+  }
+  return Buffer.from(out);
+}
+const k32 = (s: string) => createHash("sha256").update(s).digest();
+function paymentToken(seed: string): string {
+  const keys = [k32("fee-payer"), k32("isolation-payer"), k32("source"), k32("destination"), k32("mint"), b58decode("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")];
+  const data = Buffer.concat([Buffer.from([12]), Buffer.alloc(8), Buffer.from([6])]);
+  const message = Buffer.concat([Buffer.from([0x80, 2, 0, 2, keys.length]), ...keys, k32("blockhash-" + seed), Buffer.from([1, 5, 4, 2, 4, 3, 1, data.length]), data, Buffer.from([0])]);
+  const transaction = Buffer.concat([Buffer.from([2]), Buffer.alloc(128), message]).toString("base64");
+  return encodePayment({ x402Version: 1, scheme: "exact", network: "solana", payload: { transaction } } as Parameters<typeof encodePayment>[0]);
+}
+
+/**
+ * Starts a stand-in facilitator whose n-th /verify (0-based) waits holds[n] ms and then refuses with reasons[n],
+ * and the server pointed at it. Returns the server's port and the paid tool this server has.
+ */
+async function startServer(t: TestContext, holds: number[], reasons: string[]): Promise<{ port: number; paidCall: (seed: string) => string }> {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zc-isolation-"));
+  let verifies = 0;
+  const facilitator = http.createServer((req, res) => {
+    req.resume();
+    res.setHeader("content-type", "application/json");
+    if (req.url?.startsWith("/supported")) {
+      return res.end(JSON.stringify({ kinds: [{ x402Version: 1, scheme: "exact", network: "solana", extra: { feePayer: "FeePayer111111111111111111111111111111111111" } }] }));
+    }
+    if (req.url?.startsWith("/verify")) {
+      const n = Math.min(verifies++, holds.length - 1);
+      return setTimeout(() => res.end(JSON.stringify({ isValid: false, invalidReason: reasons[n] })), holds[n]);
+    }
+    res.statusCode = 404;
+    res.end("{}");
+  });
+  await new Promise<void>((r) => facilitator.listen(0, "127.0.0.1", r));
+  const port = await freePort();
+  const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
+    cwd: process.cwd(),
+    env: {
+      PATH: process.env.PATH,
+      SystemRoot: process.env.SystemRoot,
+      HOME: process.env.HOME,
+      USERPROFILE: process.env.USERPROFILE,
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+      PORT: String(port),
+      NODE_ENV: "production",
+      X402_FACILITATOR: `http://127.0.0.1:${(facilitator.address() as net.AddressInfo).port}`,
+      PAYMENT_WALLET: "Recipient11111111111111111111111111111111111",
+      X402_CLAIMS_DIR: path.join(tmp, "claims"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout?.on("data", (d) => (out += d));
+  child.stderr?.on("data", (d) => (out += d));
+  t.after(() => {
+    if (child.exitCode === null) child.kill();
+    facilitator.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+  const started = Date.now();
+  while (!/running on port/i.test(out)) {
+    assert.ok(Date.now() - started < 60_000, "the server did not start:\n" + out.slice(-600));
+    assert.equal(child.exitCode, null, "the server exited at startup:\n" + out.slice(-600));
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const listed = await rpc(port, JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" }));
+  const tool = Object.keys(ARGS).find((name) => listed.includes(`"name":"${name}"`));
+  assert.ok(tool, "no known paid tool in tools/list:\n" + listed.slice(0, 300));
+  const paidCall = (seed: string) =>
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: ARGS[tool], _meta: { "x402/payment": paymentToken(`${seed}-${Date.now()}`) } } });
+  return { port, paidCall };
+}
+
+test("a paid call held at the facilitator still gets its own answer when another client reuses its id", async (t) => {
+  const { port, paidCall } = await startServer(t, [1500], ["insufficient_funds"]);
+  const paid = rpc(port, paidCall("held"));
+  await new Promise((r) => setTimeout(r, 400)); // the paid call now waits on the facilitator
+  const free = await rpc(port, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+  const paidAnswer = await paid;
+
+  assert.match(free, /"tools":\[/, "the free client did not get its tool list");
+  assert.doesNotMatch(free, /x402\/error/, "the free client got the paid call's answer");
+  assert.notEqual(paidAnswer, "no answer", "the paid call got no answer");
+  assert.match(paidAnswer, /insufficient_funds/, "the paid client did not get its own answer");
+  assert.doesNotMatch(paidAnswer, /"tools":\[/, "the paid client got the free call's answer");
+});
+
+test("two paid calls with the same id each get their own answer, whichever finishes first", async (t) => {
+  // The first call's payment check is held 2 s, the second's 0.3 s, so the second finishes first.
+  const { port, paidCall } = await startServer(t, [2000, 300], ["first_call_refused", "second_call_refused"]);
+  const first = rpc(port, paidCall("first"));
+  await new Promise((r) => setTimeout(r, 400));
+  const second = await rpc(port, paidCall("second"));
+  const firstAnswer = await first;
+
+  assert.notEqual(second, "no answer", "the second call got no answer");
+  assert.match(second, /second_call_refused/, "the second client did not get its own answer");
+  assert.doesNotMatch(second, /first_call_refused/, "the second client got the first call's answer");
+  assert.notEqual(firstAnswer, "no answer", "the first call got no answer");
+  assert.match(firstAnswer, /first_call_refused/, "the first client did not get its own answer");
+});
