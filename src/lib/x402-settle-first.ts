@@ -21,6 +21,9 @@
  * settlement has been paid for: the result says so (x402/payment-response) and
  * the server logs it.
  *
+ * Payment tokens and transactions longer than any real payment are refused
+ * before they are parsed, so a crafted payment cannot tie up the process.
+ *
  * Requirement building and payment-token parsing follow mcpay 0.1.17
  * (MIT License, Copyright (c) MCPay). Solana ("svm") recipients only.
  */
@@ -193,10 +196,16 @@ function readShortVec(bytes: Uint8Array, offset: number): { value: number; next:
   return null;
 }
 
+/** Solana's packet limit: no transaction that can settle is longer. */
+const MAX_TRANSACTION_BYTES = 1232;
+/** An x402 token wraps one such transaction in base64 JSON; a longer string is not a payment. */
+export const MAX_PAYMENT_TOKEN_LENGTH = 4096;
+
 /** The message bytes of a base64 Solana wire transaction: everything after the signature section. */
 function wireMessage(transaction: unknown): Buffer | null {
-  if (typeof transaction !== "string") return null;
+  if (typeof transaction !== "string" || transaction.length > Math.ceil(MAX_TRANSACTION_BYTES / 3) * 4) return null;
   const bytes = Buffer.from(transaction, "base64");
+  if (bytes.length > MAX_TRANSACTION_BYTES) return null;
   const signatures = readShortVec(bytes, 0);
   if (!signatures || signatures.value === 0) return null;
   const messageStart = signatures.next + signatures.value * 64;
@@ -215,10 +224,6 @@ export function paymentClaimKey(payment: PaymentPayload): string | null {
   return message ? "svm-" + createHash("sha256").update(message).digest("hex") : null;
 }
 
-const TOKEN_PROGRAMS = new Set([
-  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
-  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
-]);
 const TRANSFER_CHECKED = 12;
 const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -234,6 +239,27 @@ function base58(bytes: Uint8Array): string {
   }
   return "1".repeat(zeros) + out;
 }
+
+function fromBase58(text: string): Buffer {
+  let n = 0n;
+  for (const ch of text) n = n * 58n + BigInt(BASE58.indexOf(ch));
+  const out: number[] = [];
+  while (n > 0n) {
+    out.unshift(Number(n & 0xffn));
+    n >>= 8n;
+  }
+  for (const ch of text) {
+    if (ch !== "1") break;
+    out.unshift(0);
+  }
+  return Buffer.from(out);
+}
+
+/** Compared as raw key bytes, so checking an instruction's program costs no encoding. */
+const TOKEN_PROGRAM_KEYS = [
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
+].map(fromBase58);
 
 /**
  * The paying wallet: the signer that authorizes the payment's one token
@@ -277,7 +303,9 @@ export function paymentAuthority(payment: PaymentPayload): string | null {
     const dataBytes = msg.subarray(data.next, data.next + data.value);
     o = data.next + data.value;
     if (o > msg.length) return null;
-    if (programIndex >= keys.value || !TOKEN_PROGRAMS.has(base58(key(programIndex)))) continue;
+    if (programIndex >= keys.value) continue;
+    const program = key(programIndex);
+    if (!TOKEN_PROGRAM_KEYS.some((k) => k.equals(program))) continue;
     if (dataBytes[0] !== TRANSFER_CHECKED) continue;
     transfers++;
     if (accountIndexes.length < 4) return null;
@@ -285,6 +313,19 @@ export function paymentAuthority(payment: PaymentPayload): string | null {
   }
   if (transfers !== 1 || authority <= 0 || authority >= signerCount || authority >= keys.value) return null;
   return base58(key(authority));
+}
+
+/**
+ * The paying wallet a payment token names, before the payment is verified or
+ * settled. Only good for refusing a call before any money moves.
+ */
+export function paymentTokenAuthority(token: string): string | null {
+  if (token.length > MAX_PAYMENT_TOKEN_LENGTH) return null;
+  try {
+    return paymentAuthority(decodePayment(token));
+  } catch {
+    return null;
+  }
 }
 
 /** Read the payment token from MCP `_meta["x402/payment"]` or an X-PAYMENT header, as mcpay does. */
@@ -338,18 +379,30 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
     lastFeePayerRefresh = now();
     feePayerCache = null;
   }
-  async function feePayers(): Promise<Map<string, string>> {
-    if (feePayerCache && now() - feePayerCache.at < FEE_PAYER_TTL_MS) return feePayerCache.byNetwork;
-    const { kinds } = await facilitator.supported();
-    const byNetwork = new Map<string, string>();
-    for (const kind of kinds) {
-      const feePayer = kind.extra?.feePayer;
-      if (kind.scheme === "exact" && typeof feePayer === "string" && !byNetwork.has(kind.network)) {
-        byNetwork.set(kind.network, feePayer);
-      }
+  let feePayersInFlight: Promise<Map<string, string>> | null = null;
+  /** The facilitator's fee payer per network. Cached; concurrent calls share one supported() request. */
+  function feePayers(): Promise<Map<string, string>> {
+    if (feePayerCache && now() - feePayerCache.at < FEE_PAYER_TTL_MS) return Promise.resolve(feePayerCache.byNetwork);
+    if (!feePayersInFlight) {
+      const pending = (async () => {
+        const { kinds } = await facilitator.supported();
+        const byNetwork = new Map<string, string>();
+        for (const kind of kinds) {
+          const feePayer = kind.extra?.feePayer;
+          if (kind.scheme === "exact" && typeof feePayer === "string" && !byNetwork.has(kind.network)) {
+            byNetwork.set(kind.network, feePayer);
+          }
+        }
+        feePayerCache = { at: now(), byNetwork };
+        return byNetwork;
+      })();
+      feePayersInFlight = pending;
+      const clear = () => {
+        if (feePayersInFlight === pending) feePayersInFlight = null;
+      };
+      pending.then(clear, clear);
     }
-    feePayerCache = { at: now(), byNetwork };
-    return byNetwork;
+    return feePayersInFlight;
   }
 
   async function buildRequirements(name: string, description: string, price: Price): Promise<PaymentRequirements[]> {
@@ -421,6 +474,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
 
         const token = readPaymentToken(extra);
         if (!token) return paymentRequired();
+        if (token.length > MAX_PAYMENT_TOKEN_LENGTH) return paymentRequired("INVALID_PAYMENT");
         let decoded: PaymentPayload;
         try {
           decoded = decodePayment(token);
