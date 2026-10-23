@@ -280,6 +280,12 @@ const paidHandler = createMcpPaidHandler(
 
 // ── Hono HTTP Server ─────────────────────────────────────────
 
+// A rejected promise inside the MCP transport must not stop the process and every
+// in-flight call with it (a paid call cut off after settlement is charged).
+process.on("unhandledRejection", (reason) => {
+  console.error("[mcp] unhandled rejection, process kept alive:", reason);
+});
+
 const app = new Hono();
 
 // Health + pricing endpoints (outside MCP, for monitoring/discovery)
@@ -294,7 +300,16 @@ app.get("/", (c) => c.html(landingHtml()));
 app.get("/dev", (c) => c.html(devHtml()));
 
 // MCP handler — x402 only (no API key auth needed)
+// mcp-handler parses POST bodies outside a try, so a malformed body would reject
+// unhandled and stop the process. Answer it with a JSON-RPC parse error instead.
 app.all("*", async (c) => {
+  if (c.req.method === "POST") {
+    try {
+      JSON.parse(await c.req.raw.clone().text());
+    } catch {
+      return c.json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null }, 400);
+    }
+  }
   return paidHandler(c.req.raw);
 });
 

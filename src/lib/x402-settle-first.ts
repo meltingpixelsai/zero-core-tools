@@ -77,11 +77,15 @@ export interface SettleFirstDeps {
   claimsDir?: string;
   now?: () => number;
   log?: (line: string) => void;
+  /** Startup information (the claim directory in use). Default: console.log */
+  info?: (line: string) => void;
 }
 
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
 const PRUNE_EVERY_MS = 10 * 60 * 1000;
 const FEE_PAYER_TTL_MS = 10 * 60 * 1000;
+/** A failed verify may mean the facilitator rotated its fee payer, but refresh at most this often. */
+const FEE_PAYER_REFRESH_MIN_MS = 30 * 1000;
 
 /**
  * Single-use payment claims: one marker file per payment, created with O_EXCL,
@@ -102,15 +106,28 @@ export class ClaimStore {
     return path.join(this.dir, key.replace(/[^A-Za-z0-9_-]/g, "_") + ".claim");
   }
 
+  private create(key: string): number {
+    return fs.openSync(this.file(key), "wx", 0o600);
+  }
+
   /** Take the claim; false when any process already holds it. Throws when the directory cannot be written. */
   tryClaim(key: string): boolean {
     this.pruneOccasionally();
     let fd: number;
     try {
-      fd = fs.openSync(this.file(key), "wx", 0o600);
+      fd = this.create(key);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") return false;
+      if (code !== "ENOENT") throw err;
+      // The directory was removed while the server ran: recreate it once.
+      fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+      try {
+        fd = this.create(key);
+      } catch (retryErr) {
+        if ((retryErr as NodeJS.ErrnoException).code === "EEXIST") return false;
+        throw retryErr;
+      }
     }
     try {
       fs.writeSync(fd, JSON.stringify({ s: "pending", t: this.now() }));
@@ -230,8 +247,15 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
   const facilitator: FacilitatorClient = deps.facilitator ?? (useFacilitator(cfg.facilitator) as FacilitatorClient);
   const claimsDir = deps.claimsDir ?? (process.env.X402_CLAIMS_DIR || path.join(os.homedir(), ".x402-claims"));
   const claims = new ClaimStore(claimsDir, now, log);
+  (deps.info ?? ((line: string) => console.log(line)))(`[x402] settle-first paid tools; payment claims in ${claimsDir}`);
 
   let feePayerCache: { at: number; byNetwork: Map<string, string> } | null = null;
+  let lastFeePayerRefresh = -Infinity;
+  function refreshFeePayerSoon(): void {
+    if (now() - lastFeePayerRefresh < FEE_PAYER_REFRESH_MIN_MS) return;
+    lastFeePayerRefresh = now();
+    feePayerCache = null;
+  }
   async function feePayers(): Promise<Map<string, string>> {
     if (feePayerCache && now() - feePayerCache.at < FEE_PAYER_TTL_MS) return feePayerCache.byNetwork;
     const { kinds } = await facilitator.supported();
@@ -341,12 +365,12 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           verified = await facilitator.verify(decoded, selected);
         } catch {
           claims.release(key);
-          feePayerCache = null;
+          refreshFeePayerSoon();
           return paymentRequired("VERIFY_FAILED");
         }
         if (!verified.isValid) {
           claims.release(key);
-          feePayerCache = null;
+          refreshFeePayerSoon();
           return paymentRequired(verified.invalidReason ?? "INVALID_PAYMENT", { payer: verified.payer });
         }
 

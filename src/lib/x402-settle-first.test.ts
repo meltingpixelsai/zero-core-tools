@@ -82,6 +82,7 @@ function harness(opts: {
     facilitator,
     claimsDir,
     log: (line) => logs.push(line),
+    info: (line) => logs.push(line),
   });
   const tools = new Map<string, Handler>();
   const server = {
@@ -178,6 +179,9 @@ test("an invalid payment is refused before settle, and the fee-payer cache is re
   assert.deepEqual(paymentEvents(h.events), ["verify"]);
   await h.handler({}, paid(token("pay-4b")));
   assert.equal(h.events.filter((e) => e === "supported").length, 2, "supported() asked again after a failed verify");
+  await h.handler({}, paid(token("pay-4c")));
+  assert.equal(h.events.filter((e) => e === "supported").length, 2, "no second refresh within 30 seconds");
+  assert.ok(h.logs.some((l) => l.includes("payment claims in")), "claim directory logged at startup");
 });
 
 test("one payment sent five times in parallel runs the tool once", async () => {
@@ -265,9 +269,19 @@ test("settled claims survive a restart; released ones do not block", async () =>
   assert.equal(claimFiles.length, 2);
 });
 
+test("a claim directory removed while the server runs is recreated", async () => {
+  const h = harness();
+  fs.rmSync(h.claimsDir, { recursive: true, force: true });
+  const result = await h.handler({}, paid(token("pay-11a")));
+  assert.equal(result.isError, undefined);
+  assert.ok(fs.existsSync(h.claimsDir));
+  assert.equal(errorCode(await h.handler({}, paid(token("pay-11a")))), "PAYMENT_ALREADY_USED");
+});
+
 test("an unwritable claim store refuses the payment before any facilitator call", async () => {
   const h = harness();
   fs.rmSync(h.claimsDir, { recursive: true, force: true });
+  fs.writeFileSync(h.claimsDir, "not a directory");
   const result = await h.handler({}, paid(token("pay-11")));
   assert.equal(errorCode(result), "PAYMENT_CLAIM_UNAVAILABLE");
   assert.deepEqual(paymentEvents(h.events), []);
