@@ -379,18 +379,30 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
     lastFeePayerRefresh = now();
     feePayerCache = null;
   }
-  async function feePayers(): Promise<Map<string, string>> {
-    if (feePayerCache && now() - feePayerCache.at < FEE_PAYER_TTL_MS) return feePayerCache.byNetwork;
-    const { kinds } = await facilitator.supported();
-    const byNetwork = new Map<string, string>();
-    for (const kind of kinds) {
-      const feePayer = kind.extra?.feePayer;
-      if (kind.scheme === "exact" && typeof feePayer === "string" && !byNetwork.has(kind.network)) {
-        byNetwork.set(kind.network, feePayer);
-      }
+  let feePayersInFlight: Promise<Map<string, string>> | null = null;
+  /** The facilitator's fee payer per network. Cached; concurrent calls share one supported() request. */
+  function feePayers(): Promise<Map<string, string>> {
+    if (feePayerCache && now() - feePayerCache.at < FEE_PAYER_TTL_MS) return Promise.resolve(feePayerCache.byNetwork);
+    if (!feePayersInFlight) {
+      const pending = (async () => {
+        const { kinds } = await facilitator.supported();
+        const byNetwork = new Map<string, string>();
+        for (const kind of kinds) {
+          const feePayer = kind.extra?.feePayer;
+          if (kind.scheme === "exact" && typeof feePayer === "string" && !byNetwork.has(kind.network)) {
+            byNetwork.set(kind.network, feePayer);
+          }
+        }
+        feePayerCache = { at: now(), byNetwork };
+        return byNetwork;
+      })();
+      feePayersInFlight = pending;
+      const clear = () => {
+        if (feePayersInFlight === pending) feePayersInFlight = null;
+      };
+      pending.then(clear, clear);
     }
-    feePayerCache = { at: now(), byNetwork };
-    return byNetwork;
+    return feePayersInFlight;
   }
 
   async function buildRequirements(name: string, description: string, price: Price): Promise<PaymentRequirements[]> {
