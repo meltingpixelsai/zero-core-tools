@@ -1,4 +1,5 @@
 import "dotenv/config";
+import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { createMcpPaidHandler } from "mcpay/handler";
@@ -14,6 +15,7 @@ import { searchWeb } from "./tools/search.js";
 import { assertUrlSafe } from "./lib/ssrf.js";
 import { createSettleFirstPaidTools, type SettleFirstConfig } from "./lib/x402-settle-first.js";
 import { mcpRequestProblem } from "./lib/request-guard.js";
+import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -314,7 +316,8 @@ app.all("*", async (c) => {
 
 // ── Start ────────────────────────────────────────────────────
 
-serve({ fetch: app.fetch, port: config.port }, () => {
+// serve() returns an http.Server here (no createServer option is passed).
+const server = serve({ fetch: app.fetch, port: config.port }, () => {
   console.log(`Zero Core Tools MCP server running on port ${config.port}`);
   console.log(`  MCP endpoint: http://localhost:${config.port}/`);
   console.log(`  Health: http://localhost:${config.port}/health`);
@@ -323,4 +326,7 @@ serve({ fetch: app.fetch, port: config.port }, () => {
   console.log(`  Payment wallet: ${config.payment.wallet}`);
   console.log(`  Facilitator: ${config.payment.facilitator}`);
   console.log(`  Network: ${config.payment.network} (${config.payment.currency})`);
-});
+}) as Server;
+
+// A stop or restart lets paid calls in flight finish. See src/lib/graceful-shutdown.ts.
+installGracefulShutdown(server);
