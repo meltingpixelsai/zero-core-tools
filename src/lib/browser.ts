@@ -26,12 +26,20 @@ function getEgressProxy(): Promise<EgressProxy> {
  * (127.0.0.0/8, ::1, 169.254.0.0/16, fe80::/10), so those are refused by the
  * proxy rather than connected to directly; it is set explicitly rather than
  * left to Playwright's default.
+ *
+ * Playwright's own signal handlers are off: by default a launch installs a
+ * SIGINT handler that closes the browser and exits the process at once, which
+ * would cut off the paid calls the graceful shutdown (graceful-shutdown.ts)
+ * waits for. index.ts closes the browser after the drain instead.
  */
 export function browserLaunchOptions(proxyServer: string): LaunchOptions {
   return {
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     proxy: { server: proxyServer, bypass: "<-loopback>" },
+    handleSIGINT: false,
+    handleSIGTERM: false,
+    handleSIGHUP: false,
   };
 }
 

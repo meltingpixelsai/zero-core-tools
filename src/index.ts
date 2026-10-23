@@ -1,4 +1,5 @@
 import "dotenv/config";
+import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { createMcpPaidHandler } from "mcpay/handler";
@@ -13,6 +14,9 @@ import { analyzeSentiment } from "./tools/sentiment.js";
 import { searchWeb } from "./tools/search.js";
 import { assertUrlSafe } from "./lib/ssrf.js";
 import { createSettleFirstPaidTools, type SettleFirstConfig } from "./lib/x402-settle-first.js";
+import { MCP_ALLOWED_METHODS, mcpRequestProblem } from "./lib/request-guard.js";
+import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
+import { closeBrowser } from "./lib/browser.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -300,22 +304,32 @@ app.get("/", (c) => c.html(landingHtml()));
 app.get("/dev", (c) => c.html(devHtml()));
 
 // MCP handler — x402 only (no API key auth needed)
-// mcp-handler parses POST bodies outside a try, so a malformed body would reject
-// unhandled and stop the process. Answer it with a JSON-RPC parse error instead.
+// Requests mcp-handler would throw on in a promise nobody awaits (a body that is
+// not JSON, or JSON too deep to re-serialize), never answer (PUT, PATCH, HEAD),
+// or misroute (one client's cancellation of another client's call) are answered
+// here instead. See src/lib/request-guard.ts.
 app.all("*", async (c) => {
+  let body: string | null = null;
   if (c.req.method === "POST") {
     try {
-      JSON.parse(await c.req.raw.clone().text());
+      body = await c.req.raw.clone().text();
     } catch {
       return c.json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null }, 400);
     }
+  }
+  const problem = mcpRequestProblem(c.req.method, body);
+  if (problem?.status === 202) return c.body(null, 202);
+  if (problem) {
+    if (problem.status === 405) c.header("Allow", MCP_ALLOWED_METHODS);
+    return c.json({ jsonrpc: "2.0", error: { code: problem.code, message: problem.message }, id: null }, problem.status);
   }
   return paidHandler(c.req.raw);
 });
 
 // ── Start ────────────────────────────────────────────────────
 
-serve({ fetch: app.fetch, port: config.port }, () => {
+// serve() returns an http.Server here (no createServer option is passed).
+const server = serve({ fetch: app.fetch, port: config.port }, () => {
   console.log(`Zero Core Tools MCP server running on port ${config.port}`);
   console.log(`  MCP endpoint: http://localhost:${config.port}/`);
   console.log(`  Health: http://localhost:${config.port}/health`);
@@ -324,4 +338,8 @@ serve({ fetch: app.fetch, port: config.port }, () => {
   console.log(`  Payment wallet: ${config.payment.wallet}`);
   console.log(`  Facilitator: ${config.payment.facilitator}`);
   console.log(`  Network: ${config.payment.network} (${config.payment.currency})`);
-});
+}) as Server;
+
+// A stop or restart lets paid calls in flight finish, then closes the shared
+// browser. See src/lib/graceful-shutdown.ts.
+installGracefulShutdown(server, { beforeExit: closeBrowser });
