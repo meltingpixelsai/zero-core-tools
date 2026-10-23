@@ -11,6 +11,8 @@ import { reviewCode } from "./tools/code-review.js";
 import { generateContent } from "./tools/content.js";
 import { analyzeSentiment } from "./tools/sentiment.js";
 import { searchWeb } from "./tools/search.js";
+import { assertUrlSafe } from "./lib/ssrf.js";
+import { createSettleFirstPaidTools, type SettleFirstConfig } from "./lib/x402-settle-first.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -87,13 +89,41 @@ function registerFreeTools(server: any): void {
 
 // ── x402 Paid Handler ────────────────────────────────────────
 
+const x402Config: SettleFirstConfig = {
+  facilitator: {
+    url: config.payment.facilitator as `${string}://${string}`,
+  },
+  recipient: {
+    svm: {
+      address: config.payment.wallet,
+      isTestnet: false,
+    },
+  },
+};
+
+// Paid tools take the payment (claim once, verify, settle) before they run.
+// mcpay's own paidTool runs the tool first and settles after, which gives
+// unsettled payments the tool for free. See src/lib/x402-settle-first.ts.
+const settleFirst = createSettleFirstPaidTools(x402Config);
+
+/** Refuse a URL the browser would refuse anyway, before the caller pays. */
+async function urlPrecheck({ url }: { url: string }): Promise<string | null> {
+  try {
+    await assertUrlSafe(url);
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
 const paidHandler = createMcpPaidHandler(
   (server) => {
     registerFreeTools(server);
+    const paidTool = settleFirst(server);
 
     // ── Scraping tools ──
 
-    server.paidTool(
+    paidTool(
       "scrape_url",
       "Scrape any URL and return cleaned text content. Powered by Playwright headless browser. Returns title, content, word count.",
       "$0.005",
@@ -108,10 +138,11 @@ const paidHandler = createMcpPaidHandler(
         } catch (err) {
           return toolError(err);
         }
-      }
+      },
+      { precheck: urlPrecheck }
     );
 
-    server.paidTool(
+    paidTool(
       "screenshot_url",
       "Take a full-page screenshot of any URL. Returns base64-encoded PNG image.",
       "$0.005",
@@ -128,10 +159,11 @@ const paidHandler = createMcpPaidHandler(
         } catch (err) {
           return toolError(err);
         }
-      }
+      },
+      { precheck: urlPrecheck }
     );
 
-    server.paidTool(
+    paidTool(
       "extract_structured_data",
       "Scrape a URL then use AI to extract structured JSON data matching your schema description. Combines Playwright scraping with Grok LLM extraction.",
       "$0.02",
@@ -146,12 +178,13 @@ const paidHandler = createMcpPaidHandler(
         } catch (err) {
           return toolError(err);
         }
-      }
+      },
+      { precheck: urlPrecheck }
     );
 
     // ── Code review ──
 
-    server.paidTool(
+    paidTool(
       "review_code",
       "AI-powered security and quality code review. Analyzes for vulnerabilities, anti-patterns, performance issues, and best practices. Returns issues with severity, suggestions, and an overall score.",
       "$0.03",
@@ -172,7 +205,7 @@ const paidHandler = createMcpPaidHandler(
 
     // ── Content generation ──
 
-    server.paidTool(
+    paidTool(
       "generate_content",
       "Generate high-quality written content. Supports blog posts, product descriptions, documentation, social posts, and emails. Customizable tone, length, and keywords.",
       "$0.05",
@@ -195,7 +228,7 @@ const paidHandler = createMcpPaidHandler(
 
     // ── Sentiment analysis ──
 
-    server.paidTool(
+    paidTool(
       "analyze_sentiment",
       "Analyze sentiment of text with entity extraction, confidence scores, and key phrase identification. Returns positive/negative/neutral/mixed with detailed breakdown.",
       "$0.01",
@@ -214,7 +247,7 @@ const paidHandler = createMcpPaidHandler(
 
     // ── Web search ──
 
-    server.paidTool(
+    paidTool(
       "search_web",
       "Search the web via Google and return organic results with titles, links, and snippets. Optionally returns answer box if available.",
       "$0.01",
@@ -232,17 +265,7 @@ const paidHandler = createMcpPaidHandler(
       }
     );
   },
-  {
-    facilitator: {
-      url: config.payment.facilitator as `${string}://${string}`,
-    },
-    recipient: {
-      svm: {
-        address: config.payment.wallet,
-        isTestnet: false,
-      },
-    },
-  },
+  x402Config,
   {
     serverInfo: { name: "zero-core-tools", version: "1.1.0" },
   },
