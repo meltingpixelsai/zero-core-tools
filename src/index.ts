@@ -14,8 +14,9 @@ import { analyzeSentiment } from "./tools/sentiment.js";
 import { searchWeb } from "./tools/search.js";
 import { assertUrlSafe } from "./lib/ssrf.js";
 import { createSettleFirstPaidTools, type SettleFirstConfig } from "./lib/x402-settle-first.js";
-import { mcpRequestProblem } from "./lib/request-guard.js";
+import { MCP_ALLOWED_METHODS, mcpRequestProblem } from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
+import { closeBrowser } from "./lib/browser.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -304,11 +305,22 @@ app.get("/dev", (c) => c.html(devHtml()));
 
 // MCP handler — x402 only (no API key auth needed)
 // Requests mcp-handler would throw on in a promise nobody awaits (a body that is
-// not JSON, or JSON too deep to re-serialize) or never answer (PUT, PATCH, HEAD)
-// get a JSON-RPC error here instead. See src/lib/request-guard.ts.
+// not JSON, or JSON too deep to re-serialize), never answer (PUT, PATCH, HEAD),
+// or misroute (one client's cancellation of another client's call) are answered
+// here instead. See src/lib/request-guard.ts.
 app.all("*", async (c) => {
-  const problem = mcpRequestProblem(c.req.method, c.req.method === "POST" ? await c.req.raw.clone().text() : null);
+  let body: string | null = null;
+  if (c.req.method === "POST") {
+    try {
+      body = await c.req.raw.clone().text();
+    } catch {
+      return c.json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null }, 400);
+    }
+  }
+  const problem = mcpRequestProblem(c.req.method, body);
+  if (problem?.status === 202) return c.body(null, 202);
   if (problem) {
+    if (problem.status === 405) c.header("Allow", MCP_ALLOWED_METHODS);
     return c.json({ jsonrpc: "2.0", error: { code: problem.code, message: problem.message }, id: null }, problem.status);
   }
   return paidHandler(c.req.raw);
@@ -328,5 +340,6 @@ const server = serve({ fetch: app.fetch, port: config.port }, () => {
   console.log(`  Network: ${config.payment.network} (${config.payment.currency})`);
 }) as Server;
 
-// A stop or restart lets paid calls in flight finish. See src/lib/graceful-shutdown.ts.
-installGracefulShutdown(server);
+// A stop or restart lets paid calls in flight finish, then closes the shared
+// browser. See src/lib/graceful-shutdown.ts.
+installGracefulShutdown(server, { beforeExit: closeBrowser });

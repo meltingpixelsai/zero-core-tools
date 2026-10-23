@@ -124,12 +124,65 @@ test("the process exits after the grace period when a request never finishes", a
   shutdown("TEST again"); // a second signal starts nothing new
   await exit.exited;
   assert.ok(Date.now() - started >= 250, "exited before the grace period");
-  assert.deepEqual(exit.codes, [0]);
+  assert.deepEqual(exit.codes, [1], "a deadline that cuts requests off exits 1");
   assert.match(logs.at(-1) ?? "", /grace period over/);
 
   server.closeAllConnections();
   assert.equal(await hanging, "ECONNRESET");
-  assert.deepEqual(exit.codes, [0], "exited twice");
+  assert.deepEqual(exit.codes, [1], "exited twice");
+});
+
+test("the cleanup runs after the drain and before the exit", async () => {
+  const { server, release, slowArrived } = slowServer();
+  const port = await listen(server);
+  const order: string[] = [];
+  const exit = exitRecorder();
+  const shutdown = installGracefulShutdown(server, {
+    graceMs: 10_000,
+    signals: [],
+    log: () => {},
+    exit: (code) => {
+      order.push(`exit ${code}`);
+      exit.exit(code);
+    },
+    beforeExit: async () => {
+      order.push("cleanup start");
+      await new Promise((r) => setTimeout(r, 50));
+      order.push("cleanup done");
+    },
+  });
+
+  const inFlight = get(port, "/slow");
+  await slowArrived;
+  shutdown("TEST");
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(order, [], "cleaned up while a request was in flight");
+  release();
+  await inFlight;
+  await exit.exited;
+  assert.deepEqual(order, ["cleanup start", "cleanup done", "exit 0"]);
+});
+
+test("a cleanup that never finishes is cut off after its timeout", async () => {
+  const server = createServer((_req, res) => res.end("ok"));
+  await listen(server);
+  const exit = exitRecorder();
+  const logs: string[] = [];
+  const shutdown = installGracefulShutdown(server, {
+    graceMs: 10_000,
+    beforeExitTimeoutMs: 100,
+    signals: [],
+    log: (m) => logs.push(m),
+    exit: exit.exit,
+    beforeExit: () => new Promise(() => {}),
+  });
+
+  const started = Date.now();
+  shutdown("TEST");
+  await exit.exited;
+  assert.ok(Date.now() - started < 2000, "waited past the cleanup timeout");
+  assert.deepEqual(exit.codes, [0]);
+  assert.match(logs.join("\n"), /cleanup took too long/);
 });
 
 test("SIGINT and SIGTERM start the shutdown by default", () => {

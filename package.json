@@ -17,7 +17,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/lib/ssrf.test.ts src/lib/egress-proxy.test.ts src/lib/x402-settle-first.test.ts src/lib/request-guard.test.ts src/lib/graceful-shutdown.test.ts"
+    "test": "tsx --test src/lib/ssrf.test.ts src/lib/egress-proxy.test.ts src/lib/x402-settle-first.test.ts src/lib/request-guard.test.ts src/lib/graceful-shutdown.test.ts src/lib/browser.test.ts src/lib/ecosystem.test.ts src/index.wiring.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.5",

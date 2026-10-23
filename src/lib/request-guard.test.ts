@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { jsonTextDepth, MCP_MAX_BATCH, MCP_MAX_JSON_DEPTH, mcpRequestProblem } from "./request-guard.js";
+import { jsonTextDepth, MCP_ALLOWED_METHODS, MCP_MAX_BATCH, MCP_MAX_JSON_DEPTH, mcpRequestProblem } from "./request-guard.js";
 
-// Same cases as RelayZero's src/api/mcp/request-guard.test.ts.
+// The depth, batch and method cases are RelayZero's (src/api/mcp/request-guard.test.ts).
 
 const nested = (depth: number) => "[".repeat(depth) + "]".repeat(depth);
 const call = JSON.stringify({
@@ -11,6 +11,7 @@ const call = JSON.stringify({
   method: "tools/call",
   params: { name: "some_tool", arguments: { context: { a: { b: [1, 2, { c: "d" }] } } }, _meta: { "x402/payment": "tok" } },
 });
+const cancel = JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1, reason: "x" } });
 
 test("mcpRequestProblem passes ordinary MCP requests on", () => {
   assert.equal(mcpRequestProblem("POST", call), null);
@@ -34,6 +35,11 @@ test("mcpRequestProblem refuses JSON nested deep enough to overflow the stack wh
   assert.equal(mcpRequestProblem("POST", nested(MCP_MAX_JSON_DEPTH + 1))?.status, 400);
 });
 
+test("mcpRequestProblem checks the depth before parsing, so a deep body is never built", () => {
+  // Not valid JSON at all (never closed): the depth scan refuses it before JSON.parse would run.
+  assert.deepEqual(mcpRequestProblem("POST", "[".repeat(100000)), { status: 400, code: -32600, message: "Invalid Request: nested too deeply" });
+});
+
 test("mcpRequestProblem caps JSON-RPC batches", () => {
   const batch = (n: number) => `[${Array.from({ length: n }, () => call).join(",")}]`;
   assert.equal(mcpRequestProblem("POST", batch(MCP_MAX_BATCH)), null);
@@ -48,6 +54,12 @@ test("mcpRequestProblem answers methods mcp-handler never responds to", () => {
   for (const method of ["PUT", "PATCH", "HEAD", "OPTIONS"]) {
     assert.equal(mcpRequestProblem(method, null)?.status, 405, method);
   }
+  assert.equal(MCP_ALLOWED_METHODS, "GET, POST, DELETE");
+});
+
+test("a cancellation is accepted and ignored, so no client can cancel another client's call", () => {
+  assert.deepEqual(mcpRequestProblem("POST", cancel), { status: 202, code: 0, message: "notifications/cancelled is ignored" });
+  assert.equal(mcpRequestProblem("POST", `[${call},${cancel}]`)?.status, 400);
 });
 
 test("jsonTextDepth counts bracket nesting and ignores brackets inside strings", () => {
