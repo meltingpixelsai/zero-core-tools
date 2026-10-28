@@ -4,7 +4,17 @@
   "description": "x402-paid MCP server for web scraping, code review, content generation, and analysis. Pay-per-call USDC on Solana. Zero Core (formerly Harvey) Tools.",
   "type": "module",
   "mcpName": "io.github.meltingpixelsai/zero-core-tools",
-  "keywords": ["mcp", "x402", "usdc", "ai-agents", "web-scraping", "code-review", "content-generation", "sentiment-analysis", "zero-core"],
+  "keywords": [
+    "mcp",
+    "x402",
+    "usdc",
+    "ai-agents",
+    "web-scraping",
+    "code-review",
+    "content-generation",
+    "sentiment-analysis",
+    "zero-core"
+  ],
   "author": "MeltingPixels <jeremy@meltingpixels.com>",
   "license": "MIT",
   "repository": {
@@ -28,11 +38,15 @@
     "mcpay": "^0.1.17",
     "playwright": "^1.50.0",
     "x402": "^0.6.5",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "wagmi": "file:stubs/wagmi-unused"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "wagmi": "$wagmi"
   }
 }

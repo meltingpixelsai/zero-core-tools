@@ -1,0 +1,8 @@
+{
+  "name": "wagmi",
+  "version": "2.19.5",
+  "private": true,
+  "main": "index.js",
+  "description": "Local placeholder, not the real wagmi. x402 lists wagmi as a dependency but never imports it; this stub keeps wagmi and its wallet SDKs (incl. the proprietary @metamask/sdk) out of the install. Version mirrors the replaced release so peer ranges stay satisfied.",
+  "license": "UNLICENSED"
+}
