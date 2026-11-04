@@ -10,6 +10,12 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 8403,
+        // Chromium's setuid sandbox helper (src/lib/browser.ts). The host restricts unprivileged user namespaces
+        // (Ubuntu 24.04, kernel.apparmor_restrict_unprivileged_userns = 1), so the namespace sandbox cannot start;
+        // Chromium uses this root-owned helper (installed by google-chrome-stable, mode 4755) instead. Without it
+        // the launch fails closed ("No usable sandbox!") and the browser tools return errors.
+        // BROWSER_SANDBOX is deliberately NOT set here: the sandbox is on.
+        CHROME_DEVEL_SANDBOX: "/opt/google/chrome/chrome-sandbox",
       },
       max_memory_restart: "512M",
       // Longer than the 90 s shutdown grace plus the 3 s browser close

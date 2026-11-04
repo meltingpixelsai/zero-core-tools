@@ -31,11 +31,32 @@ function getEgressProxy(): Promise<EgressProxy> {
  * SIGINT handler that closes the browser and exits the process at once, which
  * would cut off the paid calls the graceful shutdown (graceful-shutdown.ts)
  * waits for. index.ts closes the browser after the drain instead.
+ *
+ * Chromium's process sandbox is ON: the renderer that parses a caller's page
+ * runs in its own PID and network namespaces under seccomp-bpf, so a renderer
+ * bug does not become code running as the server's account. Playwright does
+ * not add --no-sandbox when chromiumSandbox is true, and a launch that cannot
+ * set the sandbox up fails instead of running unsandboxed; the tools then
+ * return an error for that call. The "chromium" channel is the full Chromium
+ * build (not chrome-headless-shell), the one whose sandbox was verified on the
+ * production host.
+ *
+ * On Ubuntu 24.04 unprivileged user namespaces are restricted by AppArmor, so
+ * Chromium's namespace sandbox cannot start; it then uses the setuid sandbox
+ * helper named by CHROME_DEVEL_SANDBOX in the environment (ecosystem.config.cjs
+ * sets it to the root-owned helper installed by Google Chrome). A host that
+ * allows user namespaces needs no helper.
+ *
+ * BROWSER_SANDBOX=off keeps the old unsandboxed launch for places that cannot
+ * sandbox at all (the Dockerfile runs as root in a container); the server warns
+ * once when it is off. It is never set in production.
  */
-export function browserLaunchOptions(proxyServer: string): LaunchOptions {
+export function browserLaunchOptions(proxyServer: string, sandbox: boolean = config.browser.sandbox): LaunchOptions {
   return {
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    ...(sandbox
+      ? { chromiumSandbox: true, channel: "chromium", args: ["--disable-dev-shm-usage"] }
+      : { chromiumSandbox: false, args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] }),
     proxy: { server: proxyServer, bypass: "<-loopback>" },
     handleSIGINT: false,
     handleSIGTERM: false,
@@ -43,9 +64,15 @@ export function browserLaunchOptions(proxyServer: string): LaunchOptions {
   };
 }
 
+let warnedSandboxOff = false;
+
 /** Get or create the shared Playwright browser instance */
 async function getBrowser(): Promise<Browser> {
   if (!browser || !browser.isConnected()) {
+    if (!config.browser.sandbox && !warnedSandboxOff) {
+      warnedSandboxOff = true;
+      console.warn("[browser] BROWSER_SANDBOX=off: Chromium runs WITHOUT its process sandbox");
+    }
     const proxy = await getEgressProxy();
     browser = await chromium.launch(browserLaunchOptions(proxy.url));
   }
