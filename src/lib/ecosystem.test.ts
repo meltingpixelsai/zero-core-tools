@@ -17,6 +17,13 @@ test("the Tools server is signalled alone, so its browser calls can drain", { sk
   assert.equal(app.treekill, false);
 });
 
+test("production runs Chromium sandboxed: the setuid helper is named and the sandbox is not switched off", () => {
+  const env = (app.env ?? {}) as Record<string, unknown>;
+  const helper = env.CHROME_DEVEL_SANDBOX;
+  assert.ok(typeof helper === "string" && helper.startsWith("/"), "CHROME_DEVEL_SANDBOX must be an absolute path");
+  assert.equal(env.BROWSER_SANDBOX, undefined, "BROWSER_SANDBOX must not be set in production");
+});
+
 test("the V8 heap cap leaves room for calls in flight and for memory outside the heap", () => {
   const cap = String(app.node_args ?? "").match(/--max-old-space-size=(\d+)/);
   assert.ok(cap, "no --max-old-space-size in node_args");

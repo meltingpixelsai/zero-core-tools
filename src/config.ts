@@ -31,5 +31,7 @@ export const config = {
   browser: {
     timeout: 30_000,
     maxContentLength: 50_000,
+    // Chromium's process sandbox is ON unless BROWSER_SANDBOX=off is set explicitly (see browser.ts).
+    sandbox: process.env.BROWSER_SANDBOX !== "off",
   },
 } as const;
