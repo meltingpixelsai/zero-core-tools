@@ -14,7 +14,14 @@ import { analyzeSentiment } from "./tools/sentiment.js";
 import { searchWeb } from "./tools/search.js";
 import { assertUrlSafe } from "./lib/ssrf.js";
 import { createSettleFirstPaidTools, type SettleFirstConfig } from "./lib/x402-settle-first.js";
-import { declaredBodyTooLarge, MCP_ALLOWED_METHODS, MCP_TOO_LARGE, mcpRequestProblem } from "./lib/request-guard.js";
+import {
+  MCP_ALLOWED_METHODS,
+  MCP_MAX_BODY_BYTES,
+  MCP_TOO_LARGE,
+  mcpPreReadProblem,
+  mcpRequestProblem,
+  readCappedText,
+} from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
 import { closeBrowser } from "./lib/browser.js";
 
@@ -316,14 +323,17 @@ app.get("/dev", (c) => c.html(devHtml()));
 app.all("*", async (c) => {
   let body: string | null = null;
   if (c.req.method === "POST") {
-    // A declared oversize body is refused before it is read; mcpRequestProblem checks the bytes actually read.
-    if (declaredBodyTooLarge(c.req.header("content-length"))) {
-      return c.json({ jsonrpc: "2.0", error: { code: MCP_TOO_LARGE.code, message: MCP_TOO_LARGE.message }, id: null }, 413);
-    }
+    // Size, charset and shape are settled here, and mcp-handler is then given exactly the text that was checked
+    // (a new Request built from it), so it and the SDK parse what the guard parsed. See src/lib/request-guard.ts.
+    const early = mcpPreReadProblem(c.req.header("content-length"), c.req.header("content-type"));
+    if (early) return c.json({ jsonrpc: "2.0", error: { code: early.code, message: early.message }, id: null }, early.status);
     try {
-      body = await c.req.raw.clone().text();
+      body = await readCappedText(c.req.raw.body, MCP_MAX_BODY_BYTES);
     } catch {
       return c.json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null }, 400);
+    }
+    if (body === null) {
+      return c.json({ jsonrpc: "2.0", error: { code: MCP_TOO_LARGE.code, message: MCP_TOO_LARGE.message }, id: null }, 413);
     }
   }
   const problem = mcpRequestProblem(c.req.method, body);
@@ -332,7 +342,11 @@ app.all("*", async (c) => {
     if (problem.status === 405) c.header("Allow", MCP_ALLOWED_METHODS);
     return c.json({ jsonrpc: "2.0", error: { code: problem.code, message: problem.message }, id: null }, problem.status);
   }
-  return createPaidHandler()(c.req.raw);
+  if (body === null) return createPaidHandler()(c.req.raw);
+  const headers = new Headers(c.req.raw.headers);
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
+  return createPaidHandler()(new Request(c.req.raw.url, { method: "POST", headers, body, signal: c.req.raw.signal }));
 });
 
 // ── Start ────────────────────────────────────────────────────
