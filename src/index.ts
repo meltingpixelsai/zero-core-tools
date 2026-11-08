@@ -14,7 +14,7 @@ import { analyzeSentiment } from "./tools/sentiment.js";
 import { searchWeb } from "./tools/search.js";
 import { assertUrlSafe } from "./lib/ssrf.js";
 import { createSettleFirstPaidTools, type SettleFirstConfig } from "./lib/x402-settle-first.js";
-import { MCP_ALLOWED_METHODS, mcpRequestProblem } from "./lib/request-guard.js";
+import { declaredBodyTooLarge, MCP_ALLOWED_METHODS, MCP_TOO_LARGE, mcpRequestProblem } from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
 import { closeBrowser } from "./lib/browser.js";
 
@@ -316,6 +316,10 @@ app.get("/dev", (c) => c.html(devHtml()));
 app.all("*", async (c) => {
   let body: string | null = null;
   if (c.req.method === "POST") {
+    // A declared oversize body is refused before it is read; mcpRequestProblem checks the bytes actually read.
+    if (declaredBodyTooLarge(c.req.header("content-length"))) {
+      return c.json({ jsonrpc: "2.0", error: { code: MCP_TOO_LARGE.code, message: MCP_TOO_LARGE.message }, id: null }, 413);
+    }
     try {
       body = await c.req.raw.clone().text();
     } catch {

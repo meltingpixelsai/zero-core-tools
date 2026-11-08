@@ -22,20 +22,73 @@
  * Depth, batch and method rules as in RelayZero's src/api/mcp/request-guard.ts.
  * Here the depth scan runs before parsing, so a deep body is refused before it
  * is built in memory.
+ *
+ * Size and element limits (GHSA-f897-62hf-6gxq, GHSA-46jr-4wx8-v453): the MCP
+ * SDK this server runs (the 1.18.2 copy mcpay pins) limits neither the body
+ * size nor how many array elements and object keys it validates in one
+ * request, and one request can exhaust the heap. SDK 1.32 cannot run under
+ * mcpay's mcp-handler 1.0.2 (its fake request has no rawHeaders, so the SDK
+ * sees no headers), so the limits live here: a body over 1 MiB gets 413 (the
+ * same as nginx's default cap today), and a body holding more than 1,000 array
+ * elements and object keys in total gets 400. Every tool here takes plain
+ * strings, so a real call holds fewer than 20.
  */
 
 /** Far deeper than any MCP message; tool arguments that need more are refused. */
 export const MCP_MAX_JSON_DEPTH = 64;
 /** Messages allowed in one JSON-RPC batch. */
 export const MCP_MAX_BATCH = 10;
+/** Largest POST body, in bytes (UTF-8). */
+export const MCP_MAX_BODY_BYTES = 1_048_576;
+/** Array elements plus object keys allowed in one POST body, all messages together. */
+export const MCP_MAX_ELEMENTS = 1_000;
 /** The methods mcp-handler answers (the Allow header of a 405). */
 export const MCP_ALLOWED_METHODS = "GET, POST, DELETE";
 
 export interface McpRequestProblem {
-  /** 202: a notification accepted and ignored (answer with no body); 400 and 405: a JSON-RPC error. */
-  status: 202 | 400 | 405;
+  /** 202: a notification accepted and ignored (answer with no body); 400, 405 and 413: a JSON-RPC error. */
+  status: 202 | 400 | 405 | 413;
   code: number;
   message: string;
+}
+
+/** The answer to a body over MCP_MAX_BODY_BYTES (also used before reading, from Content-Length). */
+export const MCP_TOO_LARGE: McpRequestProblem = {
+  status: 413,
+  code: -32600,
+  message: `Invalid Request: the body is over ${MCP_MAX_BODY_BYTES} bytes`,
+};
+
+/** True when a Content-Length header declares more than MCP_MAX_BODY_BYTES. */
+export function declaredBodyTooLarge(contentLength: string | undefined): boolean {
+  if (contentLength === undefined || !/^\d{1,16}$/.test(contentLength.trim())) return false;
+  return Number(contentLength.trim()) > MCP_MAX_BODY_BYTES;
+}
+
+/**
+ * Array elements plus object keys in a parsed JSON value. Counting stops once it passes `limit`, and a container's
+ * children are queued only after its own count is added, so the work stays bounded by the limit.
+ */
+export function jsonElementCount(value: unknown, limit: number): number {
+  let count = 0;
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (Array.isArray(v)) {
+      count += v.length;
+      if (count > limit) return count;
+      for (const x of v) if (typeof x === "object" && x !== null) stack.push(x);
+    } else if (typeof v === "object" && v !== null) {
+      const keys = Object.keys(v);
+      count += keys.length;
+      if (count > limit) return count;
+      for (const k of keys) {
+        const x = (v as Record<string, unknown>)[k];
+        if (typeof x === "object" && x !== null) stack.push(x);
+      }
+    }
+  }
+  return count;
 }
 
 /** Deepest bracket nesting in JSON text, skipping string contents: one pass, no allocation. */
@@ -69,6 +122,10 @@ export function mcpRequestProblem(method: string, body: string | null): McpReque
   }
   if (method !== "POST") return null;
   const text = body ?? "";
+  // A UTF-16 length over the cap is always over it in UTF-8 too, so the exact byte count runs only near the cap.
+  if (text.length > MCP_MAX_BODY_BYTES || (text.length * 3 > MCP_MAX_BODY_BYTES && Buffer.byteLength(text, "utf8") > MCP_MAX_BODY_BYTES)) {
+    return MCP_TOO_LARGE;
+  }
   if (jsonTextDepth(text) > MCP_MAX_JSON_DEPTH) {
     return { status: 400, code: -32600, message: "Invalid Request: nested too deeply" };
   }
@@ -77,6 +134,9 @@ export function mcpRequestProblem(method: string, body: string | null): McpReque
     parsed = JSON.parse(text);
   } catch {
     return { status: 400, code: -32700, message: "Parse error" };
+  }
+  if (jsonElementCount(parsed, MCP_MAX_ELEMENTS) > MCP_MAX_ELEMENTS) {
+    return { status: 400, code: -32600, message: `Invalid Request: more than ${MCP_MAX_ELEMENTS} array elements and object keys` };
   }
   if (Array.isArray(parsed)) {
     if (parsed.length > MCP_MAX_BATCH) {

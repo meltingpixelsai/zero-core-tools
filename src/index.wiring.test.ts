@@ -104,6 +104,13 @@ test("the server answers what mcp-handler would not, and drains on SIGINT", asyn
   assert.equal((await send(port, "POST", "/mcp", "[".repeat(5000) + "]".repeat(5000))).status, 400);
   const cancel = JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } });
   assert.equal((await send(port, "POST", "/mcp", cancel)).status, 202);
+  // Size and element limits (GHSA-f897-62hf-6gxq, GHSA-46jr-4wx8-v453), answered before mcp-handler sees the request:
+  // a body over 1 MiB (sent chunked, so the bytes actually read are checked) and a call holding more than 1,000 array
+  // elements and object keys. The Content-Length pre-check is covered by declaredBodyTooLarge's unit test.
+  const big = JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "x", arguments: { text: "a".repeat(1_100_000) } } });
+  assert.equal((await send(port, "POST", "/mcp", big)).status, 413);
+  const wide = JSON.stringify({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "x", arguments: { items: Array.from({ length: 2_000 }, () => 0) } } });
+  assert.equal((await send(port, "POST", "/mcp", wide)).status, 400);
   assert.equal((await send(port, "GET", "/health")).status, 200);
 
   child.send("sigint");
