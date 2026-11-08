@@ -346,6 +346,10 @@ app.all("*", async (c) => {
   const headers = new Headers(c.req.raw.headers);
   headers.delete("content-length");
   headers.delete("transfer-encoding");
+  // The checked text is UTF-8 JSON: say exactly that, so no later parser can read a charset parameter differently.
+  // A missing or non-JSON media type is passed on as it is, and the SDK refuses it as before.
+  const mediaType = (headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
+  if (mediaType === "application/json") headers.set("content-type", "application/json");
   return createPaidHandler()(new Request(c.req.raw.url, { method: "POST", headers, body, signal: c.req.raw.signal }));
 });
 

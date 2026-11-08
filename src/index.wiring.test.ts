@@ -153,9 +153,10 @@ test("the server answers what mcp-handler would not, and drains on SIGINT", asyn
   // Size, charset, shape and element limits (GHSA-f897-62hf-6gxq, GHSA-46jr-4wx8-v453), answered before mcp-handler
   // sees the request.
   const head = (extra: string) => `POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n${extra}\r\n`;
-  // A chunked body over 1 MiB: the counting reader stops past the cap (64 KiB chunks, 18 of them).
+  // A chunked body over 1 MiB that never ends (no closing chunk): the counting reader answers past the cap, while a
+  // reader that waits for the whole body would never answer (64 KiB chunks, 20 of them).
   const piece = "a".repeat(65_536);
-  const chunked = [...Array.from({ length: 18 }, () => `10000\r\n${piece}\r\n`), "0\r\n\r\n"];
+  const chunked = Array.from({ length: 20 }, () => `10000\r\n${piece}\r\n`);
   assert.equal(await rawStatus(port, head("Transfer-Encoding: chunked\r\n"), chunked), 413);
   // A declared Content-Length over 1 MiB, refused from the headers alone (no body is sent).
   assert.equal(await rawStatus(port, head("Content-Length: 2000000\r\n")), 413);
