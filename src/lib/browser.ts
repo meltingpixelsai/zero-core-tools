@@ -51,11 +51,14 @@ function getEgressProxy(): Promise<EgressProxy> {
  * BROWSER_CHANNEL=chromium selects the bundled build by name: the full
  * Chromium build (not chrome-headless-shell), for a host without Google Chrome.
  *
- * On Ubuntu 24.04 unprivileged user namespaces are restricted by AppArmor, so
- * the bundled Chromium's namespace sandbox cannot start. Either build uses the
- * setuid sandbox helper named by CHROME_DEVEL_SANDBOX when the environment sets
- * it (ecosystem.config.cjs sets it to the root-owned helper installed by Google
- * Chrome). A host that allows user namespaces needs no helper.
+ * On Ubuntu 24.04 unprivileged user namespaces are restricted by AppArmor.
+ * Google Chrome's package installs an AppArmor profile that lets its own
+ * binary create them, so Chrome runs its namespace sandbox there. The bundled
+ * Chromium has no such profile: its namespace sandbox cannot start, and it
+ * needs the setuid sandbox helper named by CHROME_DEVEL_SANDBOX in the
+ * environment (ecosystem.config.cjs names the root-owned helper installed by
+ * Google Chrome) or its launch fails. A host that allows user namespaces needs
+ * no helper.
  *
  * BROWSER_SANDBOX=off keeps the old unsandboxed launch for places that cannot
  * sandbox at all (the Dockerfile runs as root in a container); the server warns
