@@ -17,11 +17,18 @@ test("the Tools server is signalled alone, so its browser calls can drain", { sk
   assert.equal(app.treekill, false);
 });
 
-test("production runs Chromium sandboxed: the setuid helper is named and the sandbox is not switched off", () => {
+test("production runs the browser sandboxed: the bundled build's setuid helper is named and the sandbox is not switched off", () => {
   const env = (app.env ?? {}) as Record<string, unknown>;
   const helper = env.CHROME_DEVEL_SANDBOX;
   assert.ok(typeof helper === "string" && helper.startsWith("/"), "CHROME_DEVEL_SANDBOX must be an absolute path");
   assert.equal(env.BROWSER_SANDBOX, undefined, "BROWSER_SANDBOX must not be set in production");
+});
+
+test("production runs the host's Google Chrome: the bundled build is not selected", () => {
+  // Any BROWSER_CHANNEL value but "chromium" already means Google Chrome (config.ts); leaving it unset keeps
+  // production on the default, the build that gets security fixes first.
+  const env = (app.env ?? {}) as Record<string, unknown>;
+  assert.equal(env.BROWSER_CHANNEL, undefined, "BROWSER_CHANNEL must not be set in production");
 });
 
 test("the V8 heap cap leaves room for calls in flight and for memory outside the heap", () => {

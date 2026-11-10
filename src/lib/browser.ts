@@ -1,5 +1,5 @@
 import { chromium, type Browser, type LaunchOptions, type Page } from "playwright";
-import { config } from "../config.js";
+import { config, type BrowserChannel } from "../config.js";
 import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
 import { assertUrlSafe, isUrlSafe } from "./ssrf.js";
 
@@ -37,25 +37,46 @@ function getEgressProxy(): Promise<EgressProxy> {
  * bug does not become code running as the server's account. Playwright does
  * not add --no-sandbox when chromiumSandbox is true, and a launch that cannot
  * set the sandbox up fails instead of running unsandboxed; the tools then
- * return an error for that call. The "chromium" channel is the full Chromium
- * build (not chrome-headless-shell), the one whose sandbox was verified on the
- * production host.
+ * return an error for that call.
  *
- * On Ubuntu 24.04 unprivileged user namespaces are restricted by AppArmor, so
- * Chromium's namespace sandbox cannot start; it then uses the setuid sandbox
+ * The sandboxed launch runs the host's Google Chrome (channel "chrome") by
+ * default, not the build Playwright bundles (Chrome for Testing, which
+ * Playwright installs under the name "chromium"). Callers choose the pages
+ * this browser loads, so it needs browser security fixes promptly: Google
+ * ships them in Chrome first, and a Playwright release bundles them later (on
+ * 2026-11-09 Chrome 157.0.8103.50 fixed a bug exploited in the wild while the
+ * Playwright version locked here, 1.64.1, bundled 156.0.8078.4). If Google
+ * Chrome is not installed, or will not start, the launch fails and the tools
+ * return an error for that call; it does not fall back to the bundled build.
+ * Payment settles before a tool runs, so such a call has already been paid for.
+ * Keeping the host's Chrome package current is then part of running this
+ * server, and so is restarting the server after a Chrome upgrade: it keeps one
+ * browser process until that process ends, and logs the version at each launch.
+ * BROWSER_CHANNEL=chromium selects the bundled build by name: the full build
+ * (not chrome-headless-shell), for a host without Google Chrome.
+ *
+ * On Ubuntu 24.04 unprivileged user namespaces are restricted by AppArmor.
+ * Ubuntu ships an AppArmor profile (/etc/apparmor.d/chrome, package apparmor)
+ * that lets the Google Chrome binary at /opt/google/chrome/chrome create them,
+ * so Chrome runs its namespace sandbox there. The bundled build has no such
+ * profile: its namespace sandbox cannot start, and it needs the setuid sandbox
  * helper named by CHROME_DEVEL_SANDBOX in the environment (ecosystem.config.cjs
- * sets it to the root-owned helper installed by Google Chrome). A host that
- * allows user namespaces needs no helper.
+ * names the root-owned helper installed by Google Chrome) or its launch fails.
+ * A host that allows user namespaces needs no helper.
  *
  * BROWSER_SANDBOX=off keeps the old unsandboxed launch for places that cannot
  * sandbox at all (the Dockerfile runs as root in a container); the server warns
  * once when it is off. It is never set in production.
  */
-export function browserLaunchOptions(proxyServer: string, sandbox: boolean = config.browser.sandbox): LaunchOptions {
+export function browserLaunchOptions(
+  proxyServer: string,
+  sandbox: boolean = config.browser.sandbox,
+  channel: BrowserChannel = config.browser.channel,
+): LaunchOptions {
   return {
     headless: true,
     ...(sandbox
-      ? { chromiumSandbox: true, channel: "chromium", args: ["--disable-dev-shm-usage"] }
+      ? { chromiumSandbox: true, channel, args: ["--disable-dev-shm-usage"] }
       : { chromiumSandbox: false, args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] }),
     proxy: { server: proxyServer, bypass: "<-loopback>" },
     handleSIGINT: false,
@@ -74,7 +95,11 @@ async function getBrowser(): Promise<Browser> {
       console.warn("[browser] BROWSER_SANDBOX=off: Chromium runs WITHOUT its process sandbox");
     }
     const proxy = await getEgressProxy();
-    browser = await chromium.launch(browserLaunchOptions(proxy.url));
+    const options = browserLaunchOptions(proxy.url);
+    browser = await chromium.launch(options);
+    // One line per launch, so the log shows which build and version is really serving calls. The build name is read
+    // from the options this launch was given, and the version is the one the browser itself reports.
+    console.log(`[browser] launched ${options.channel ?? "bundled headless shell, no sandbox"} ${browser.version()}`);
   }
   return browser;
 }
