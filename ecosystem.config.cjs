@@ -10,15 +10,16 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 8403,
-        // The setuid sandbox helper for Playwright's bundled Chromium (src/lib/browser.ts). The host restricts
+        // The setuid sandbox helper for the build Playwright bundles (src/lib/browser.ts). The host restricts
         // unprivileged user namespaces (Ubuntu 24.04, kernel.apparmor_restrict_unprivileged_userns = 1). Google
-        // Chrome, the build the server runs, has its own AppArmor profile and uses its namespace sandbox. The
-        // bundled Chromium (BROWSER_CHANNEL=chromium) has no profile: it sandboxes through this root-owned helper
-        // (installed by google-chrome-stable, mode 4755), and without it its launch fails closed ("No usable
-        // sandbox!") and the browser tools return errors.
+        // Chrome, the build the server runs, is covered by the AppArmor profile Ubuntu ships for it and uses its
+        // namespace sandbox. The bundled build (BROWSER_CHANNEL=chromium) has no profile: it sandboxes through this
+        // root-owned helper (installed by google-chrome-stable, mode 4755), and without it its launch fails closed
+        // ("No usable sandbox!") and the browser tools return errors.
         // BROWSER_SANDBOX is deliberately NOT set here: the sandbox is on.
         // BROWSER_CHANNEL is deliberately NOT set here either: the server runs the host's Google Chrome
-        // (/opt/google/chrome, package google-chrome-stable), which must be kept current.
+        // (/opt/google/chrome, package google-chrome-stable). Keep that package current, and restart this server
+        // after each Chrome upgrade: it keeps one browser process until that process ends.
         CHROME_DEVEL_SANDBOX: "/opt/google/chrome/chrome-sandbox",
       },
       max_memory_restart: "512M",

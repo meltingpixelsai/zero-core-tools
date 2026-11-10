@@ -2,7 +2,7 @@ export type BrowserChannel = "chrome" | "chromium";
 
 /**
  * The browser build the sandboxed launch runs (see lib/browser.ts). Only the exact name "chromium" selects the
- * Chromium build Playwright bundles; anything else, a typo included, means the host's Google Chrome.
+ * build Playwright bundles; anything else, a typo included, means the host's Google Chrome.
  */
 export function browserChannel(value: string | undefined): BrowserChannel {
   return value === "chromium" ? "chromium" : "chrome";

@@ -11,7 +11,7 @@ test("the browser launch leaves SIGINT, SIGTERM and SIGHUP to the server's grace
   assert.equal(options.handleSIGHUP, false);
 });
 
-test("the browser launches with its process sandbox on, as the host's Google Chrome or the full Chromium build", () => {
+test("the browser launches with its process sandbox on, as the host's Google Chrome or the bundled full build", () => {
   // A renderer bug in a caller's page must not become code running as the server's account. Playwright adds
   // --no-sandbox itself when chromiumSandbox is false, so the flag must be true and the args must not carry it.
   for (const channel of ["chrome", "chromium"] as const) {
@@ -23,13 +23,25 @@ test("the browser launches with its process sandbox on, as the host's Google Chr
     assert.ok(!args.includes("--disable-setuid-sandbox"), "--disable-setuid-sandbox is in the launch args");
     assert.ok(!args.some((a) => a.startsWith("--no-zygote")), "--no-zygote is in the launch args");
   }
-  // With no explicit channel the launch uses the configured one.
-  assert.equal(browserLaunchOptions("http://127.0.0.1:1", true).channel, config.browser.channel);
+});
+
+test("with no BROWSER_CHANNEL or BROWSER_SANDBOX in the environment the launch is Google Chrome, sandboxed", () => {
+  // Pins the wiring in config.ts, not only the parser below: this fails if the production default ever stops being
+  // Google Chrome with the sandbox on. The unit tests run without these two variables; a run that sets one fails
+  // here on purpose instead of skipping.
+  assert.equal(process.env.BROWSER_CHANNEL, undefined, "run the unit tests without BROWSER_CHANNEL");
+  assert.equal(process.env.BROWSER_SANDBOX, undefined, "run the unit tests without BROWSER_SANDBOX");
+  assert.equal(config.browser.channel, "chrome");
+  assert.equal(config.browser.sandbox, true);
+  const options = browserLaunchOptions("http://127.0.0.1:1");
+  assert.equal(options.channel, "chrome");
+  assert.equal(options.chromiumSandbox, true);
+  assert.ok(!(options.args ?? []).includes("--no-sandbox"), "--no-sandbox is in the default launch args");
 });
 
 test("the host's Google Chrome is the default: only the exact name chromium selects the bundled build", () => {
   // Google Chrome gets security fixes before a Playwright release bundles them, so a missing or mistyped
-  // BROWSER_CHANNEL must not quietly select the bundled Chromium.
+  // BROWSER_CHANNEL must not quietly select the bundled build.
   assert.equal(browserChannel(undefined), "chrome");
   assert.equal(browserChannel(""), "chrome");
   assert.equal(browserChannel("chromium"), "chromium");

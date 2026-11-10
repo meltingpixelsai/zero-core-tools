@@ -40,25 +40,29 @@ function getEgressProxy(): Promise<EgressProxy> {
  * return an error for that call.
  *
  * The sandboxed launch runs the host's Google Chrome (channel "chrome") by
- * default, not the Chromium build Playwright bundles. Callers choose the pages
+ * default, not the build Playwright bundles (Chrome for Testing, which
+ * Playwright installs under the name "chromium"). Callers choose the pages
  * this browser loads, so it needs browser security fixes promptly: Google
  * ships them in Chrome first, and a Playwright release bundles them later (on
  * 2026-11-09 Chrome 157.0.8103.50 fixed a bug exploited in the wild while the
  * newest Playwright still bundled a build from before the fix). If Google
- * Chrome is not installed the launch fails and the tools return an error for
- * that call; it does not fall back to the bundled build. Keeping the host's
- * Chrome package current is then part of running this server.
- * BROWSER_CHANNEL=chromium selects the bundled build by name: the full
- * Chromium build (not chrome-headless-shell), for a host without Google Chrome.
+ * Chrome is not installed, or will not start, the launch fails and the tools
+ * return an error for that call; it does not fall back to the bundled build.
+ * Payment settles before a tool runs, so such a call has already been paid for.
+ * Keeping the host's Chrome package current is then part of running this
+ * server, and so is restarting the server after a Chrome upgrade: it keeps one
+ * browser process until that process ends, and logs the version at each launch.
+ * BROWSER_CHANNEL=chromium selects the bundled build by name: the full build
+ * (not chrome-headless-shell), for a host without Google Chrome.
  *
  * On Ubuntu 24.04 unprivileged user namespaces are restricted by AppArmor.
- * Google Chrome's package installs an AppArmor profile that lets its own
- * binary create them, so Chrome runs its namespace sandbox there. The bundled
- * Chromium has no such profile: its namespace sandbox cannot start, and it
- * needs the setuid sandbox helper named by CHROME_DEVEL_SANDBOX in the
- * environment (ecosystem.config.cjs names the root-owned helper installed by
- * Google Chrome) or its launch fails. A host that allows user namespaces needs
- * no helper.
+ * Ubuntu ships an AppArmor profile (/etc/apparmor.d/chrome, package apparmor)
+ * that lets the Google Chrome binary at /opt/google/chrome/chrome create them,
+ * so Chrome runs its namespace sandbox there. The bundled build has no such
+ * profile: its namespace sandbox cannot start, and it needs the setuid sandbox
+ * helper named by CHROME_DEVEL_SANDBOX in the environment (ecosystem.config.cjs
+ * names the root-owned helper installed by Google Chrome) or its launch fails.
+ * A host that allows user namespaces needs no helper.
  *
  * BROWSER_SANDBOX=off keeps the old unsandboxed launch for places that cannot
  * sandbox at all (the Dockerfile runs as root in a container); the server warns
@@ -92,6 +96,9 @@ async function getBrowser(): Promise<Browser> {
     }
     const proxy = await getEgressProxy();
     browser = await chromium.launch(browserLaunchOptions(proxy.url));
+    // One line per launch, so the log shows which build and version is really serving calls.
+    const build = config.browser.sandbox ? config.browser.channel : "bundled headless shell, no sandbox";
+    console.log(`[browser] launched ${build} ${browser.version()}`);
   }
   return browser;
 }
