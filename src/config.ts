@@ -12,12 +12,12 @@ export function browserChannel(value: string | undefined): BrowserChannel {
  * Browser settings for an environment. It reads nothing but its argument, so the tests can pin what an empty or a
  * production environment gives without depending on the shell that runs them.
  */
-export function browserConfig(env: Readonly<Record<string, string | undefined>>): {
+export function browserConfig(env: Readonly<Record<string, string | undefined>>): Readonly<{
   timeout: number;
   maxContentLength: number;
   sandbox: boolean;
   channel: BrowserChannel;
-} {
+}> {
   return {
     timeout: 30_000,
     maxContentLength: 50_000,

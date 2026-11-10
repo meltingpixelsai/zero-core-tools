@@ -35,6 +35,10 @@ test("an environment that sets nothing gives Google Chrome, sandboxed, and exact
   }
   assert.equal(browserConfig({ BROWSER_CHANNEL: "chromium" }).channel, "chromium");
   assert.equal(browserConfig({ BROWSER_SANDBOX: "off" }).sandbox, false);
+  // Only the exact value "off" turns the sandbox off: a value that reads like "on", or a near miss, leaves it on.
+  for (const value of ["on", "1", "true", "yes", "0", "false", "no", "OFF", "Off", "off ", " off"]) {
+    assert.equal(browserConfig({ BROWSER_SANDBOX: value }).sandbox, true, `BROWSER_SANDBOX=${JSON.stringify(value)}`);
+  }
   // The whole options object: an added executablePath, env, ignoreDefaultArgs or argument would show up here.
   const defaults = browserConfig({});
   assert.deepEqual(browserLaunchOptions("http://127.0.0.1:1", defaults.sandbox, defaults.channel), {
@@ -49,7 +53,9 @@ test("an environment that sets nothing gives Google Chrome, sandboxed, and exact
   });
 });
 
-test("the server's browser settings and the launch defaults both come from the process environment through browserConfig", () => {
+test("the server's browser settings equal browserConfig of the process environment, and the launch defaults equal those settings", () => {
+  // True in whatever shell runs this. Run it with NODE_ENV=production as well (the deploy does) to check the
+  // production environment's wiring too.
   assert.deepEqual(config.browser, browserConfig(process.env));
   assert.deepEqual(
     browserLaunchOptions("http://127.0.0.1:1"),
