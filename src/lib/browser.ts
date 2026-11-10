@@ -45,7 +45,7 @@ function getEgressProxy(): Promise<EgressProxy> {
  * this browser loads, so it needs browser security fixes promptly: Google
  * ships them in Chrome first, and a Playwright release bundles them later (on
  * 2026-11-09 Chrome 157.0.8103.50 fixed a bug exploited in the wild while the
- * newest Playwright still bundled a build from before the fix). If Google
+ * Playwright version locked here, 1.64.1, bundled 156.0.8078.4). If Google
  * Chrome is not installed, or will not start, the launch fails and the tools
  * return an error for that call; it does not fall back to the bundled build.
  * Payment settles before a tool runs, so such a call has already been paid for.
@@ -95,10 +95,11 @@ async function getBrowser(): Promise<Browser> {
       console.warn("[browser] BROWSER_SANDBOX=off: Chromium runs WITHOUT its process sandbox");
     }
     const proxy = await getEgressProxy();
-    browser = await chromium.launch(browserLaunchOptions(proxy.url));
-    // One line per launch, so the log shows which build and version is really serving calls.
-    const build = config.browser.sandbox ? config.browser.channel : "bundled headless shell, no sandbox";
-    console.log(`[browser] launched ${build} ${browser.version()}`);
+    const options = browserLaunchOptions(proxy.url);
+    browser = await chromium.launch(options);
+    // One line per launch, so the log shows which build and version is really serving calls. The build name is read
+    // from the options this launch was given, and the version is the one the browser itself reports.
+    console.log(`[browser] launched ${options.channel ?? "bundled headless shell, no sandbox"} ${browser.version()}`);
   }
   return browser;
 }

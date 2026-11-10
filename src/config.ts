@@ -8,6 +8,26 @@ export function browserChannel(value: string | undefined): BrowserChannel {
   return value === "chromium" ? "chromium" : "chrome";
 }
 
+/**
+ * Browser settings for an environment. It reads nothing but its argument, so the tests can pin what an empty or a
+ * production environment gives without depending on the shell that runs them.
+ */
+export function browserConfig(env: Readonly<Record<string, string | undefined>>): {
+  timeout: number;
+  maxContentLength: number;
+  sandbox: boolean;
+  channel: BrowserChannel;
+} {
+  return {
+    timeout: 30_000,
+    maxContentLength: 50_000,
+    // The browser's process sandbox is ON unless BROWSER_SANDBOX=off is set explicitly (see browser.ts).
+    sandbox: env.BROWSER_SANDBOX !== "off",
+    // The sandboxed launch runs the host's Google Chrome unless BROWSER_CHANNEL=chromium is set explicitly.
+    channel: browserChannel(env.BROWSER_CHANNEL),
+  };
+}
+
 export const config = {
   port: parseInt(process.env.PORT || "8403", 10),
 
@@ -38,12 +58,5 @@ export const config = {
   },
 
   // Browser config
-  browser: {
-    timeout: 30_000,
-    maxContentLength: 50_000,
-    // Chromium's process sandbox is ON unless BROWSER_SANDBOX=off is set explicitly (see browser.ts).
-    sandbox: process.env.BROWSER_SANDBOX !== "off",
-    // The sandboxed launch runs the host's Google Chrome unless BROWSER_CHANNEL=chromium is set explicitly.
-    channel: browserChannel(process.env.BROWSER_CHANNEL),
-  },
+  browser: browserConfig(process.env),
 } as const;

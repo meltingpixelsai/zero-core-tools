@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { browserChannel, config } from "../config.js";
+import { browserChannel, browserConfig, config } from "../config.js";
 import { browserLaunchOptions } from "./browser.js";
 
 test("the browser launch leaves SIGINT, SIGTERM and SIGHUP to the server's graceful shutdown", () => {
@@ -25,18 +25,36 @@ test("the browser launches with its process sandbox on, as the host's Google Chr
   }
 });
 
-test("with no BROWSER_CHANNEL or BROWSER_SANDBOX in the environment the launch is Google Chrome, sandboxed", () => {
-  // Pins the wiring in config.ts, not only the parser below: this fails if the production default ever stops being
-  // Google Chrome with the sandbox on. The unit tests run without these two variables; a run that sets one fails
-  // here on purpose instead of skipping.
-  assert.equal(process.env.BROWSER_CHANNEL, undefined, "run the unit tests without BROWSER_CHANNEL");
-  assert.equal(process.env.BROWSER_SANDBOX, undefined, "run the unit tests without BROWSER_SANDBOX");
-  assert.equal(config.browser.channel, "chrome");
-  assert.equal(config.browser.sandbox, true);
-  const options = browserLaunchOptions("http://127.0.0.1:1");
-  assert.equal(options.channel, "chrome");
-  assert.equal(options.chromiumSandbox, true);
-  assert.ok(!(options.args ?? []).includes("--no-sandbox"), "--no-sandbox is in the default launch args");
+test("an environment that sets nothing gives Google Chrome, sandboxed, and exactly these launch options", () => {
+  // browserConfig reads only the environment it is given, so this does not depend on the shell running the tests.
+  // NODE_ENV must not change the answer (production sets it in ecosystem.config.cjs), nor may an empty value.
+  for (const env of [{}, { NODE_ENV: "production" }, { BROWSER_CHANNEL: "", BROWSER_SANDBOX: "" }]) {
+    const settings = browserConfig(env);
+    assert.equal(settings.channel, "chrome", JSON.stringify(env));
+    assert.equal(settings.sandbox, true, JSON.stringify(env));
+  }
+  assert.equal(browserConfig({ BROWSER_CHANNEL: "chromium" }).channel, "chromium");
+  assert.equal(browserConfig({ BROWSER_SANDBOX: "off" }).sandbox, false);
+  // The whole options object: an added executablePath, env, ignoreDefaultArgs or argument would show up here.
+  const defaults = browserConfig({});
+  assert.deepEqual(browserLaunchOptions("http://127.0.0.1:1", defaults.sandbox, defaults.channel), {
+    headless: true,
+    chromiumSandbox: true,
+    channel: "chrome",
+    args: ["--disable-dev-shm-usage"],
+    proxy: { server: "http://127.0.0.1:1", bypass: "<-loopback>" },
+    handleSIGINT: false,
+    handleSIGTERM: false,
+    handleSIGHUP: false,
+  });
+});
+
+test("the server's browser settings and the launch defaults both come from the process environment through browserConfig", () => {
+  assert.deepEqual(config.browser, browserConfig(process.env));
+  assert.deepEqual(
+    browserLaunchOptions("http://127.0.0.1:1"),
+    browserLaunchOptions("http://127.0.0.1:1", config.browser.sandbox, config.browser.channel),
+  );
 });
 
 test("the host's Google Chrome is the default: only the exact name chromium selects the bundled build", () => {
