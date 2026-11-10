@@ -24,6 +24,13 @@ test("production runs Chromium sandboxed: the setuid helper is named and the san
   assert.equal(env.BROWSER_SANDBOX, undefined, "BROWSER_SANDBOX must not be set in production");
 });
 
+test("production runs the host's Google Chrome: the bundled Chromium is not selected", () => {
+  // Any BROWSER_CHANNEL value but "chromium" already means Google Chrome (config.ts); leaving it unset keeps
+  // production on the default, the build that gets security fixes first.
+  const env = (app.env ?? {}) as Record<string, unknown>;
+  assert.equal(env.BROWSER_CHANNEL, undefined, "BROWSER_CHANNEL must not be set in production");
+});
+
 test("the V8 heap cap leaves room for calls in flight and for memory outside the heap", () => {
   const cap = String(app.node_args ?? "").match(/--max-old-space-size=(\d+)/);
   assert.ok(cap, "no --max-old-space-size in node_args");

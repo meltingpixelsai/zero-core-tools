@@ -215,8 +215,9 @@ test("tunnels an allowed destination, connecting only to the vetted address (no 
 
 // End-to-end: the finding's exploit against a real browser launched with the
 // production launch options. Needs a local Chromium-family browser, so it runs
-// only when SSRF_E2E_BROWSER names one: "chromium" (Playwright's bundled
-// build) or a channel such as "msedge" / "chrome".
+// only when SSRF_E2E_BROWSER names the channel to launch: "chrome" (Google
+// Chrome, production's default), "chromium" (Playwright's bundled full build)
+// or another installed channel such as "msedge".
 const e2eBrowser = process.env.SSRF_E2E_BROWSER;
 test(
   "browser: a 302 from an allowed host to loopback is refused at the redirect hop",
@@ -257,10 +258,8 @@ test(
     const proxy = await startEgressProxy(async (host) =>
       host === "public.test" ? ["127.0.0.1"] : resolvePublicAddresses(host),
     );
-    const browser = await chromium.launch({
-      ...browserLaunchOptions(proxy.url),
-      ...(e2eBrowser === "chromium" ? {} : { channel: e2eBrowser }),
-    });
+    // The channel is always the one named: the launch options' own default is no longer the bundled build.
+    const browser = await chromium.launch({ ...browserLaunchOptions(proxy.url), channel: e2eBrowser });
     try {
       // Interception on, as createPage has it: the first hop is route-allowed,
       // and the redirect hop never reaches this handler.

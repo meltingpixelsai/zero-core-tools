@@ -1,3 +1,13 @@
+export type BrowserChannel = "chrome" | "chromium";
+
+/**
+ * The browser build the sandboxed launch runs (see lib/browser.ts). Only the exact name "chromium" selects the
+ * Chromium build Playwright bundles; anything else, a typo included, means the host's Google Chrome.
+ */
+export function browserChannel(value: string | undefined): BrowserChannel {
+  return value === "chromium" ? "chromium" : "chrome";
+}
+
 export const config = {
   port: parseInt(process.env.PORT || "8403", 10),
 
@@ -33,5 +43,7 @@ export const config = {
     maxContentLength: 50_000,
     // Chromium's process sandbox is ON unless BROWSER_SANDBOX=off is set explicitly (see browser.ts).
     sandbox: process.env.BROWSER_SANDBOX !== "off",
+    // The sandboxed launch runs the host's Google Chrome unless BROWSER_CHANNEL=chromium is set explicitly.
+    channel: browserChannel(process.env.BROWSER_CHANNEL),
   },
 } as const;

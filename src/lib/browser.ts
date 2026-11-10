@@ -1,5 +1,5 @@
 import { chromium, type Browser, type LaunchOptions, type Page } from "playwright";
-import { config } from "../config.js";
+import { config, type BrowserChannel } from "../config.js";
 import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
 import { assertUrlSafe, isUrlSafe } from "./ssrf.js";
 
@@ -37,25 +37,39 @@ function getEgressProxy(): Promise<EgressProxy> {
  * bug does not become code running as the server's account. Playwright does
  * not add --no-sandbox when chromiumSandbox is true, and a launch that cannot
  * set the sandbox up fails instead of running unsandboxed; the tools then
- * return an error for that call. The "chromium" channel is the full Chromium
- * build (not chrome-headless-shell), the one whose sandbox was verified on the
- * production host.
+ * return an error for that call.
+ *
+ * The sandboxed launch runs the host's Google Chrome (channel "chrome") by
+ * default, not the Chromium build Playwright bundles. Callers choose the pages
+ * this browser loads, so it needs browser security fixes promptly: Google
+ * ships them in Chrome first, and a Playwright release bundles them later (on
+ * 2026-11-09 Chrome 157.0.8103.50 fixed a bug exploited in the wild while the
+ * newest Playwright still bundled a build from before the fix). If Google
+ * Chrome is not installed the launch fails and the tools return an error for
+ * that call; it does not fall back to the bundled build. Keeping the host's
+ * Chrome package current is then part of running this server.
+ * BROWSER_CHANNEL=chromium selects the bundled build by name: the full
+ * Chromium build (not chrome-headless-shell), for a host without Google Chrome.
  *
  * On Ubuntu 24.04 unprivileged user namespaces are restricted by AppArmor, so
- * Chromium's namespace sandbox cannot start; it then uses the setuid sandbox
- * helper named by CHROME_DEVEL_SANDBOX in the environment (ecosystem.config.cjs
- * sets it to the root-owned helper installed by Google Chrome). A host that
- * allows user namespaces needs no helper.
+ * the bundled Chromium's namespace sandbox cannot start. Either build uses the
+ * setuid sandbox helper named by CHROME_DEVEL_SANDBOX when the environment sets
+ * it (ecosystem.config.cjs sets it to the root-owned helper installed by Google
+ * Chrome). A host that allows user namespaces needs no helper.
  *
  * BROWSER_SANDBOX=off keeps the old unsandboxed launch for places that cannot
  * sandbox at all (the Dockerfile runs as root in a container); the server warns
  * once when it is off. It is never set in production.
  */
-export function browserLaunchOptions(proxyServer: string, sandbox: boolean = config.browser.sandbox): LaunchOptions {
+export function browserLaunchOptions(
+  proxyServer: string,
+  sandbox: boolean = config.browser.sandbox,
+  channel: BrowserChannel = config.browser.channel,
+): LaunchOptions {
   return {
     headless: true,
     ...(sandbox
-      ? { chromiumSandbox: true, channel: "chromium", args: ["--disable-dev-shm-usage"] }
+      ? { chromiumSandbox: true, channel, args: ["--disable-dev-shm-usage"] }
       : { chromiumSandbox: false, args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] }),
     proxy: { server: proxyServer, bypass: "<-loopback>" },
     handleSIGINT: false,
