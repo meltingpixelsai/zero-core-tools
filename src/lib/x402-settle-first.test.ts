@@ -28,6 +28,7 @@ import {
   paymentAuthority,
   paymentClaimKey,
   paymentTokenAuthority,
+  CANCELLED_UNPAID,
   PREFLIGHT_FAILED,
   type FacilitatorClient,
   type SettleFirstConfig,
@@ -460,6 +461,29 @@ test("a preflight that throws refuses the call the same way: nothing settled, cl
   assert.deepEqual(paymentEvents(h.events), ["verify", "preflight"]);
   broken = false;
   assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+});
+
+test("a call cancelled while its preflight ran is not settled, and the payment can be used later", async () => {
+  const cancel = new AbortController();
+  let cancelDuringCheck = true;
+  const h = harness({
+    preflight: () => {
+      if (cancelDuringCheck) cancel.abort(); // the caller gives up while the check (a browser launch) runs
+      return null;
+    },
+  });
+  const tok = token("pay-18");
+  const cancelled = await h.handler({}, { ...paid(tok), signal: cancel.signal });
+  assert.equal(cancelled.isError, true);
+  assert.equal(cancelled.content[0].text, `Error: ${CANCELLED_UNPAID}`);
+  assert.equal(cancelled._meta, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "preflight"], "nothing settled, tool not run");
+  assert.ok(h.logs.some((l) => l.includes("call cancelled during the preflight check")));
+  // The claim was released, and a signal that is not aborted changes nothing.
+  cancelDuringCheck = false;
+  const again = await h.handler({}, { ...paid(tok), signal: new AbortController().signal });
+  assert.equal(again.isError, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "preflight", "verify", "preflight", "settle", "tool"]);
 });
 
 test("a transaction without a message is refused before any facilitator call", async () => {

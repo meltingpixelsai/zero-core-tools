@@ -22,14 +22,27 @@ function getEgressProxy(): Promise<EgressProxy> {
  * the browser's TCP connections only: with Chromium's default policy a page's
  * script can open an RTCPeerConnection and have the browser send STUN packets
  * straight from the host to any address and port the page names, a private or
- * link-local one included, which the SOCKS proxy never sees. With this policy
- * WebRTC uses UDP only through a proxy that carries it, and this proxy refuses
- * UDP ASSOCIATE (egress-proxy.ts), so no WebRTC UDP leaves the host; WebRTC's
- * TCP connections go through the proxy like any other. The end-to-end test in
- * egress-proxy.test.ts shows the packets arriving without the flag and none
- * with it.
+ * link-local one included, which the SOCKS proxy never sees. With the policy
+ * "disable_non_proxied_udp" WebRTC sends UDP only through a proxy that can
+ * carry it, which a SOCKS proxy as Chromium uses it cannot, so no WebRTC UDP
+ * leaves the host; WebRTC's TCP connections go through the proxy like any
+ * other.
+ *
+ * The policy has two switches, and each build obeys only one of them (measured
+ * on Linux, 2026-11-11: Google Chrome 157.0.8103.50, and Playwright 1.64.1's
+ * bundled 156.0.8078.4 as the full build and as chrome-headless-shell):
+ * - Google Chrome and the bundled full build obey --webrtc-ip-handling-policy
+ *   and ignore the other;
+ * - chrome-headless-shell, which the BROWSER_SANDBOX=off launch runs, obeys
+ *   --force-webrtc-ip-handling-policy and ignores the other.
+ * Every launch gets both. The end-to-end test in egress-proxy.test.ts shows,
+ * for the build it is pointed at, the packets arriving without the switches
+ * and none with them: run it again when the browser's major version changes,
+ * because a switch a build stops obeying fails silently.
  */
 export const WEBRTC_NO_DIRECT_UDP = "--webrtc-ip-handling-policy=disable_non_proxied_udp";
+export const WEBRTC_NO_DIRECT_UDP_HEADLESS_SHELL = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp";
+export const WEBRTC_NO_DIRECT_UDP_ARGS: readonly string[] = [WEBRTC_NO_DIRECT_UDP, WEBRTC_NO_DIRECT_UDP_HEADLESS_SHELL];
 
 /**
  * Launch options for the shared browser. All browser traffic leaves through
@@ -84,8 +97,8 @@ export const WEBRTC_NO_DIRECT_UDP = "--webrtc-ip-handling-policy=disable_non_pro
  * sandbox at all (the Dockerfile runs as root in a container); the server warns
  * once when it is off. It is never set in production.
  *
- * WebRTC is held to the proxy as well (WEBRTC_NO_DIRECT_UDP, below), on both
- * launches.
+ * WebRTC is held to the proxy as well, on the sandboxed and the unsandboxed
+ * launch (WEBRTC_NO_DIRECT_UDP_ARGS, above).
  */
 export function browserLaunchOptions(
   proxyServer: string,
@@ -95,12 +108,13 @@ export function browserLaunchOptions(
   return {
     headless: true,
     ...(sandbox
-      ? { chromiumSandbox: true, channel, args: ["--disable-dev-shm-usage", WEBRTC_NO_DIRECT_UDP] }
+      ? { chromiumSandbox: true, channel, args: ["--disable-dev-shm-usage", ...WEBRTC_NO_DIRECT_UDP_ARGS] }
       : {
           chromiumSandbox: false,
-          args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", WEBRTC_NO_DIRECT_UDP],
+          args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", ...WEBRTC_NO_DIRECT_UDP_ARGS],
         }),
     proxy: { server: proxyServer, bypass: "<-loopback>" },
+    timeout: LAUNCH_TIMEOUT_MS,
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,
@@ -128,7 +142,40 @@ export class BrowserUnavailableError extends Error {
 
 /** After a failed launch, calls inside this window are refused without another launch attempt. */
 export const LAUNCH_RETRY_AFTER_MS = 15_000;
-const LAUNCH_ERROR_LOG_CHARS = 2_000;
+
+/**
+ * How long one launch may take. Playwright's own default is three minutes. A launch can run while a caller's payment
+ * is verified and not yet settled (browserReady, below), and a signed payment stays valid for about a minute, so a
+ * browser that has not started by now is treated as one that cannot start.
+ */
+export const LAUNCH_TIMEOUT_MS = 30_000;
+
+const LOG_HEAD_CHARS = 1_000;
+const LOG_TAIL_CHARS = 5_000;
+
+/**
+ * An error's text for the server log, cut in the middle when it is long. Playwright's launch and closed-browser
+ * errors put the command line first and the browser's own output, which names the cause, last: both ends are kept.
+ */
+export function errorForLog(err: unknown): string {
+  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  if (detail.length <= LOG_HEAD_CHARS + LOG_TAIL_CHARS) return detail;
+  const cut = detail.length - LOG_HEAD_CHARS - LOG_TAIL_CHARS;
+  return `${detail.slice(0, LOG_HEAD_CHARS)}\n[... ${cut} characters cut ...]\n${detail.slice(-LOG_TAIL_CHARS)}`;
+}
+
+const CALLER_MESSAGE_CHARS = 300;
+
+/**
+ * What a caller is told when a browser tool fails: the first line of the error, and no more. Playwright appends the
+ * call log to its errors, and to a "browser has been closed" error the browser's log, which starts with the
+ * executable's path and the whole command line (the proxy's port and the profile folder included). The first line
+ * is the part a caller can use ("page.goto: Timeout 30000ms exceeded.", "URL not allowed ...").
+ */
+export function callerErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return (message.split("\n", 1)[0] ?? "").slice(0, CALLER_MESSAGE_CHARS);
+}
 
 /** The part of a browser the holder below needs; Playwright's Browser satisfies it. */
 export interface BrowserHandle {
@@ -146,7 +193,10 @@ export interface SharedBrowserDeps<B extends BrowserHandle> {
 export interface SharedBrowser<B extends BrowserHandle> {
   /** The connected browser, launching it if there is none. Rejects with BrowserUnavailableError and nothing else. */
   get(): Promise<B>;
-  /** Close the browser, waiting first for a launch in flight so its process is not left behind. */
+  /**
+   * Close the browser, waiting first for a launch that is in flight when close is called. It is not final: a get()
+   * after it launches again. The server calls it once, at shutdown, after the calls in flight have drained.
+   */
   close(): Promise<void>;
 }
 
@@ -163,7 +213,8 @@ export interface SharedBrowser<B extends BrowserHandle> {
  *   next call.
  */
 export function createSharedBrowser<B extends BrowserHandle>(deps: SharedBrowserDeps<B>): SharedBrowser<B> {
-  const now = deps.now ?? Date.now;
+  // A clock that only moves forward: the retry window must not stretch when the wall clock is set back.
+  const now = deps.now ?? (() => performance.now());
   const log = deps.log ?? ((line: string) => console.error(line));
   const retryAfterMs = deps.retryAfterMs ?? LAUNCH_RETRY_AFTER_MS;
   let current: B | null = null;
@@ -178,8 +229,7 @@ export function createSharedBrowser<B extends BrowserHandle>(deps: SharedBrowser
       return launched;
     } catch (err) {
       failedAt = now();
-      const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
-      log(`[browser] launch failed; callers are told "${BROWSER_UNAVAILABLE}": ${detail.slice(0, LAUNCH_ERROR_LOG_CHARS)}`);
+      log(`[browser] launch failed; callers are told "${BROWSER_UNAVAILABLE}": ${errorForLog(err)}`);
       throw new BrowserUnavailableError();
     }
   }

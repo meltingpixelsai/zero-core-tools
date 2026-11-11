@@ -219,14 +219,23 @@ test("tunnels an allowed destination, connecting only to the vetted address (no 
 // production launch options. Needs a local Chromium-family browser, so it runs
 // only when SSRF_E2E_BROWSER names the channel to launch: "chrome" (Google
 // Chrome, production's default), "chromium" (Playwright's bundled full build)
-// or another installed channel such as "msedge".
+// or another installed channel such as "msedge". "headless-shell" is not a
+// channel: it runs the BROWSER_SANDBOX=off launch as it is, with no channel,
+// which is chrome-headless-shell (what the Dockerfile's image runs).
 const e2eBrowser = process.env.SSRF_E2E_BROWSER;
+
+/** The launch options the end-to-end tests use for the build SSRF_E2E_BROWSER names. */
+async function e2eLaunchOptions(proxyUrl: string): Promise<import("playwright").LaunchOptions> {
+  const { browserLaunchOptions } = await import("./browser.js");
+  // The channel is always the one named: the launch options' own default is no longer the bundled build.
+  return e2eBrowser === "headless-shell" ? browserLaunchOptions(proxyUrl, false) : { ...browserLaunchOptions(proxyUrl), channel: e2eBrowser };
+}
+
 test(
   "browser: a 302 from an allowed host to loopback is refused at the redirect hop",
-  { skip: e2eBrowser ? false : "set SSRF_E2E_BROWSER=chromium|msedge|chrome to run" },
+  { skip: e2eBrowser ? false : "set SSRF_E2E_BROWSER=chrome|chromium|headless-shell|msedge to run" },
   async () => {
     const { chromium } = await import("playwright");
-    const { browserLaunchOptions } = await import("./browser.js");
 
     let secretHits = 0;
     const secret = http.createServer((_req, res) => {
@@ -260,8 +269,7 @@ test(
     const proxy = await startEgressProxy(async (host) =>
       host === "public.test" ? ["127.0.0.1"] : resolvePublicAddresses(host),
     );
-    // The channel is always the one named: the launch options' own default is no longer the bundled build.
-    const browser = await chromium.launch({ ...browserLaunchOptions(proxy.url), channel: e2eBrowser });
+    const browser = await chromium.launch(await e2eLaunchOptions(proxy.url));
     try {
       // Interception on, as createPage has it: the first hop is route-allowed,
       // and the redirect hop never reaches this handler.
@@ -315,14 +323,15 @@ test(
 
 // End-to-end: WebRTC must not send UDP around the proxy. A page's script names a STUN server (here, a UDP socket of
 // this test on one of the host's own addresses) and the test counts the packets that socket receives. The same page
-// runs twice: first with the production launch options minus WEBRTC_NO_DIRECT_UDP, where packets MUST arrive (that
-// run proves this test can see the leak on this host), then with the production options as they are, where none may.
+// runs twice: first with the launch options minus the WebRTC switches, where packets MUST arrive (that run proves
+// this test can see the leak on this host and this build), then with the options as they are, where none may.
+// SSRF_E2E_BROWSER=headless-shell runs it on the BROWSER_SANDBOX=off launch, which obeys a different switch.
 test(
   "browser: WebRTC sends no UDP around the proxy (a STUN server the page names gets no packet)",
-  { skip: e2eBrowser ? false : "set SSRF_E2E_BROWSER=chromium|msedge|chrome to run" },
+  { skip: e2eBrowser ? false : "set SSRF_E2E_BROWSER=chrome|chromium|headless-shell|msedge to run" },
   async () => {
     const { chromium } = await import("playwright");
-    const { browserLaunchOptions, WEBRTC_NO_DIRECT_UDP } = await import("./browser.js");
+    const { WEBRTC_NO_DIRECT_UDP_ARGS } = await import("./browser.js");
 
     const hostAddress = Object.values(os.networkInterfaces())
       .flat()
@@ -345,13 +354,15 @@ test(
     const proxy = await startEgressProxy(async (host) =>
       host === "public.test" ? ["127.0.0.1"] : resolvePublicAddresses(host),
     );
-    const production = browserLaunchOptions(proxy.url);
-    assert.ok((production.args ?? []).includes(WEBRTC_NO_DIRECT_UDP), "the production launch options carry the WebRTC policy");
+    const production = await e2eLaunchOptions(proxy.url);
+    for (const arg of WEBRTC_NO_DIRECT_UDP_ARGS) {
+      assert.ok((production.args ?? []).includes(arg), `the launch options carry ${arg}`);
+    }
 
     /** Loads the page through the proxy, gathers ICE candidates against the STUN server, returns the packets seen. */
     const gather = async (args: string[]): Promise<{ packets: number; candidates: string[] }> => {
       packets = 0;
-      const browser = await chromium.launch({ ...production, args, channel: e2eBrowser });
+      const browser = await chromium.launch({ ...production, args });
       try {
         const page = await browser.newPage();
         await page.goto(`http://public.test:${sitePort}/`, { waitUntil: "load", timeout: 15_000 });
@@ -384,7 +395,7 @@ test(
     };
 
     try {
-      const withoutPolicy = await gather((production.args ?? []).filter((a) => a !== WEBRTC_NO_DIRECT_UDP));
+      const withoutPolicy = await gather((production.args ?? []).filter((a) => !WEBRTC_NO_DIRECT_UDP_ARGS.includes(a)));
       assert.ok(
         withoutPolicy.packets > 0,
         `control: without the policy the STUN server must get a packet, or this test proves nothing here (candidates: ${JSON.stringify(withoutPolicy.candidates)})`,

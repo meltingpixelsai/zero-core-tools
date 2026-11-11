@@ -5,7 +5,11 @@ import {
   BROWSER_UNAVAILABLE,
   BrowserUnavailableError,
   LAUNCH_RETRY_AFTER_MS,
+  LAUNCH_TIMEOUT_MS,
+  callerErrorMessage,
+  errorForLog,
   WEBRTC_NO_DIRECT_UDP,
+  WEBRTC_NO_DIRECT_UDP_ARGS,
   browserLaunchOptions,
   createSharedBrowser,
   type BrowserHandle,
@@ -53,8 +57,13 @@ test("an environment that sets nothing gives Google Chrome, sandboxed, and exact
     headless: true,
     chromiumSandbox: true,
     channel: "chrome",
-    args: ["--disable-dev-shm-usage", "--webrtc-ip-handling-policy=disable_non_proxied_udp"],
+    args: [
+      "--disable-dev-shm-usage",
+      "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    ],
     proxy: { server: "http://127.0.0.1:1", bypass: "<-loopback>" },
+    timeout: 30_000,
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,
@@ -102,14 +111,21 @@ test("the egress proxy and the loopback rule stay in place whether the sandbox i
   }
 });
 
-test("WebRTC is kept from sending UDP around the proxy on every launch, sandboxed or not, on either build", () => {
-  // The proxy setting covers TCP only. The end-to-end test in egress-proxy.test.ts shows what this flag stops.
-  assert.equal(WEBRTC_NO_DIRECT_UDP, "--webrtc-ip-handling-policy=disable_non_proxied_udp");
-  for (const sandbox of [true, false]) {
-    for (const channel of ["chrome", "chromium"] as const) {
-      const args = browserLaunchOptions("socks5://127.0.0.1:1", sandbox, channel).args ?? [];
-      assert.equal(args.filter((a) => a.includes("webrtc")).join(" "), WEBRTC_NO_DIRECT_UDP, `sandbox ${String(sandbox)}, ${channel}`);
-    }
+test("every launch, sandboxed or not, carries both WebRTC switches: the full builds obey one, the headless shell the other", () => {
+  // This pins the strings only. Whether a build obeys them is what the end-to-end test in egress-proxy.test.ts
+  // shows, with real packets: SSRF_E2E_BROWSER=chrome, chromium, or headless-shell (the BROWSER_SANDBOX=off launch).
+  assert.deepEqual(WEBRTC_NO_DIRECT_UDP_ARGS, [
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  ]);
+  assert.equal(WEBRTC_NO_DIRECT_UDP, WEBRTC_NO_DIRECT_UDP_ARGS[0]);
+  const launches = [
+    browserLaunchOptions("socks5://127.0.0.1:1", true, "chrome"),
+    browserLaunchOptions("socks5://127.0.0.1:1", true, "chromium"),
+    browserLaunchOptions("socks5://127.0.0.1:1", false), // no channel: Playwright runs chrome-headless-shell
+  ];
+  for (const options of launches) {
+    assert.deepEqual((options.args ?? []).filter((a) => a.includes("webrtc")), WEBRTC_NO_DIRECT_UDP_ARGS, JSON.stringify(options));
   }
 });
 
@@ -166,7 +182,45 @@ test("calls that arrive while the browser is launching share that one launch", a
   assert.equal(l.calls(), 1, "a connected browser is reused");
 });
 
-test("a failed launch is logged in full and reaches every waiting caller as the fixed message only", async () => {
+test("a launch is given 30 s, not Playwright's three minutes: it can run while a verified payment waits to be settled", () => {
+  assert.equal(LAUNCH_TIMEOUT_MS, 30_000);
+  for (const sandbox of [true, false]) {
+    assert.equal(browserLaunchOptions("socks5://127.0.0.1:1", sandbox).timeout, LAUNCH_TIMEOUT_MS);
+  }
+});
+
+test("a long error keeps both ends in the log: the command line first, the browser's own output last", () => {
+  const head = "browserType.launch: Target page, context or browser has been closed\nBrowser logs:\n<launching> /opt/google/chrome/chrome ";
+  const tail = "\n[pid=123][err] error while loading shared libraries: libnss3.so: cannot open shared object file";
+  const long = new Error(head + "--flag ".repeat(3_000) + tail);
+  long.stack = long.message; // no frames, so the end of the text is the end of the message
+  const logged = errorForLog(long);
+  assert.ok(logged.length < 6_200, `logged ${logged.length} characters`);
+  assert.ok(logged.startsWith(head.slice(0, 200)));
+  assert.ok(logged.endsWith(tail), "the cause, at the end, is kept");
+  assert.match(logged, /\[\.\.\. \d+ characters cut \.\.\.\]/);
+  // A short error is logged whole, and a thrown non-error as its text.
+  const short = new Error("no chrome");
+  assert.equal(errorForLog(short), short.stack);
+  assert.equal(errorForLog("plain text"), "plain text");
+});
+
+test("a caller is told the first line of a browser tool's error and nothing after it", () => {
+  // The shape of Playwright's error when the browser goes away during a call.
+  const closed = new Error(
+    "page.goto: Target page, context or browser has been closed\nBrowser logs:\n\n<launching> /opt/google/chrome/chrome --proxy-server=socks5://127.0.0.1:41234 --user-data-dir=/tmp/playwright_chromiumdev_profile-abc\n<launched> pid=4242",
+  );
+  assert.equal(callerErrorMessage(closed), "page.goto: Target page, context or browser has been closed");
+  const timeout = new Error('page.goto: Timeout 30000ms exceeded.\nCall log:\n  - navigating to "https://example.com/", waiting until "networkidle"');
+  assert.equal(callerErrorMessage(timeout), "page.goto: Timeout 30000ms exceeded.");
+  // One-line errors pass unchanged, the fixed browser message included.
+  assert.equal(callerErrorMessage(new Error("URL not allowed")), "URL not allowed");
+  assert.equal(callerErrorMessage(new BrowserUnavailableError()), BROWSER_UNAVAILABLE);
+  assert.equal(callerErrorMessage("thrown text\nsecond line"), "thrown text");
+  assert.equal(callerErrorMessage(new Error("x".repeat(1_000))).length, 300);
+});
+
+test("a failed launch is logged with its cause and reaches every waiting caller as the fixed message only", async () => {
   const l = manualLauncher();
   const logs: string[] = [];
   const shared = createSharedBrowser({ launch: l.launch, log: (line) => logs.push(line), now: () => 1_000 });

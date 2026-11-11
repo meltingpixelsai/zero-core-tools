@@ -183,6 +183,9 @@ test("a browser tool whose browser cannot start refuses a valid payment before s
   // The same payment was accepted for verification three times: each refusal released its claim.
   assert.equal(seen.settle, 0);
   assert.match(out(), /\[browser\] launch failed; callers are told/);
+  // The launch failed for the reason this test arranged, and the log names it: the words the answers were checked
+  // for above are really in the cause.
+  assert.match(out(), /Executable doesn't exist at .*no-browsers/, "the log names the cause:\n" + out().slice(-800));
   assert.match(out(), /not ready, payment not settled, tool not run/);
   assert.equal(out().split("[browser] launch failed").length - 1, 1, "three calls inside the retry window make one launch attempt");
 
@@ -201,10 +204,11 @@ test("a browser tool whose browser cannot start refuses a valid payment before s
 const e2eBrowser = process.env.SSRF_E2E_BROWSER;
 test(
   "browser: with a browser that starts, two paid calls at once share one launch, both settle, and the page comes back",
-  { skip: e2eBrowser ? false : "set SSRF_E2E_BROWSER=chromium|chrome to run (needs the public internet)" },
+  { skip: e2eBrowser ? false : "set SSRF_E2E_BROWSER=chrome|chromium|headless-shell to run (needs the public internet)" },
   async (t) => {
     const { seen, out, call } = await startServer(t, () => ({
-      BROWSER_CHANNEL: e2eBrowser,
+      // "headless-shell" is the BROWSER_SANDBOX=off launch (no channel), as in egress-proxy.test.ts.
+      ...(e2eBrowser === "headless-shell" ? { BROWSER_SANDBOX: "off" } : { BROWSER_CHANNEL: e2eBrowser }),
       ...(process.env.CHROME_DEVEL_SANDBOX ? { CHROME_DEVEL_SANDBOX: process.env.CHROME_DEVEL_SANDBOX } : {}),
       ...(process.env.PLAYWRIGHT_BROWSERS_PATH ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH } : {}),
     }));

@@ -23,7 +23,7 @@ import {
   readCappedText,
 } from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
-import { BROWSER_UNAVAILABLE_UNPAID, browserReady, closeBrowser } from "./lib/browser.js";
+import { BROWSER_UNAVAILABLE_UNPAID, browserReady, callerErrorMessage, closeBrowser, errorForLog } from "./lib/browser.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -34,6 +34,18 @@ function toolResult(data: unknown) {
 function toolError(err: unknown) {
   return {
     content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+    isError: true as const,
+  };
+}
+
+/**
+ * A browser tool's failure. The caller, who has paid, gets the first line of the error; the whole error goes to the
+ * log. See callerErrorMessage in src/lib/browser.ts for what the rest of a Playwright error can carry.
+ */
+function browserToolError(tool: string, err: unknown) {
+  console.error(`[browser] ${tool} failed: ${errorForLog(err)}`);
+  return {
+    content: [{ type: "text" as const, text: `Error: ${callerErrorMessage(err)}` }],
     isError: true as const,
   };
 }
@@ -162,7 +174,7 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await scrapeUrl(url, max_length ?? 10_000));
         } catch (err) {
-          return toolError(err);
+          return browserToolError("scrape_url", err);
         }
       },
       browserToolOptions
@@ -183,7 +195,7 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await screenshotUrl(url, full_page ?? true, width ?? 1280, height ?? 720));
         } catch (err) {
-          return toolError(err);
+          return browserToolError("screenshot_url", err);
         }
       },
       browserToolOptions
@@ -202,7 +214,7 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await extractStructuredData(url, schema_description));
         } catch (err) {
-          return toolError(err);
+          return browserToolError("extract_structured_data", err);
         }
       },
       browserToolOptions
