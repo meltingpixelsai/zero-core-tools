@@ -23,7 +23,14 @@ import {
   readCappedText,
 } from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
-import { BROWSER_UNAVAILABLE_UNPAID, browserReady, callerErrorMessage, closeBrowser, errorForLog } from "./lib/browser.js";
+import {
+  BROWSER_UNAVAILABLE_UNPAID,
+  browserReady,
+  browserWentAway,
+  callerErrorMessage,
+  closeBrowser,
+  errorForLog,
+} from "./lib/browser.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -39,11 +46,12 @@ function toolError(err: unknown) {
 }
 
 /**
- * A browser tool's failure. The caller, who has paid, gets the first line of the error; the whole error goes to the
- * log. See callerErrorMessage in src/lib/browser.ts for what the rest of a Playwright error can carry.
+ * A browser tool's failure. The caller, who has paid, gets the first line of the error (callerErrorMessage in
+ * src/lib/browser.ts says what the rest of a Playwright error can carry). When the error says the browser went away
+ * during the call, it is also logged, on one line, with the browser's own log; other failures are not logged.
  */
 function browserToolError(tool: string, err: unknown) {
-  console.error(`[browser] ${tool} failed: ${errorForLog(err)}`);
+  if (browserWentAway(err)) console.error(`[browser] ${tool}: the browser went away during the call: ${errorForLog(err)}`);
   return {
     content: [{ type: "text" as const, text: `Error: ${callerErrorMessage(err)}` }],
     isError: true as const,

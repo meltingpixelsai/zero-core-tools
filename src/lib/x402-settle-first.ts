@@ -79,17 +79,15 @@ export interface PaidToolOptions<A> {
    * A readiness check for what the tool depends on (the browser, for the browser tools). It runs once the payment
    * has been verified and before it is settled, so only a caller holding a valid payment can set it off. Return a
    * message to refuse the call: the payment is then not settled and its claim is released, so the same payment can
-   * be presented again later. A check that throws refuses the call the same way, and so does a call whose caller
-   * cancelled it (the request's abort signal) while the check ran.
+   * be presented again later. A check that throws refuses the call the same way. Keep the check short: a caller
+   * that gives up while it runs is still settled and the tool still runs, as for any call in flight (a cancellation
+   * is accepted and ignored, see request-guard.ts).
    */
   preflight?: (args: A) => Promise<string | null> | string | null;
 }
 
 /** What a caller is told when a preflight check throws instead of answering. */
 export const PREFLIGHT_FAILED = "The service is not ready for this call. No payment was taken. Try again later.";
-
-/** The answer to a call that was cancelled while its preflight check ran. */
-export const CANCELLED_UNPAID = "The call was cancelled. No payment was taken.";
 
 export interface SettleFirstDeps {
   facilitator?: FacilitatorClient;
@@ -541,13 +539,6 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
             claims.release(key);
             log(`[x402] ${name}: not ready, payment not settled, tool not run: ${notReady} payer=${payer}`);
             return { isError: true, content: [{ type: "text", text: `Error: ${notReady}` }] };
-          }
-          // The check can take a while (a browser launch). A caller that cancelled meanwhile is not charged for an
-          // answer it will not read.
-          if ((extra as { signal?: { aborted?: unknown } } | null | undefined)?.signal?.aborted === true) {
-            claims.release(key);
-            log(`[x402] ${name}: call cancelled during the preflight check, payment not settled, tool not run payer=${payer}`);
-            return { isError: true, content: [{ type: "text", text: `Error: ${CANCELLED_UNPAID}` }] };
           }
         }
 

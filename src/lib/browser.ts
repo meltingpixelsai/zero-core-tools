@@ -153,15 +153,45 @@ export const LAUNCH_TIMEOUT_MS = 30_000;
 const LOG_HEAD_CHARS = 1_000;
 const LOG_TAIL_CHARS = 5_000;
 
+// C0 and C1 control characters, DEL, and the two Unicode line separators. Built from code points, so that no
+// editor or tool can turn an escape written here into the character itself.
+const CONTROL_CHARACTERS = new RegExp(`[\\x00-\\x1f\\x7f-\\x9f${String.fromCharCode(0x2028, 0x2029)}]`, "g");
+
 /**
- * An error's text for the server log, cut in the middle when it is long. Playwright's launch and closed-browser
- * errors put the command line first and the browser's own output, which names the cause, last: both ends are kept.
+ * An error's text for the server log: on ONE line, and cut in the middle when it is long.
+ *
+ * One line, with every control character written as an escape, because part of the text can come from a caller's
+ * page: an exception thrown by the page's own script is copied into Playwright's error. Logged as it is, such a
+ * page could add lines of its own to the log (a made-up payment line, say) or send terminal escape codes to
+ * whoever reads it.
+ *
+ * Cut in the middle, because Playwright's launch and closed-browser errors put the command line first and the
+ * browser's own output, which names the cause, near the end (before the stack frames): both ends are kept.
  */
 export function errorForLog(err: unknown): string {
-  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
-  if (detail.length <= LOG_HEAD_CHARS + LOG_TAIL_CHARS) return detail;
-  const cut = detail.length - LOG_HEAD_CHARS - LOG_TAIL_CHARS;
-  return `${detail.slice(0, LOG_HEAD_CHARS)}\n[... ${cut} characters cut ...]\n${detail.slice(-LOG_TAIL_CHARS)}`;
+  let detail: string;
+  try {
+    detail = err instanceof Error ? err.stack || err.message : String(err);
+  } catch {
+    detail = "(an error that cannot be turned into text)";
+  }
+  if (detail.length > LOG_HEAD_CHARS + LOG_TAIL_CHARS) {
+    const cut = detail.length - LOG_HEAD_CHARS - LOG_TAIL_CHARS;
+    detail = `${detail.slice(0, LOG_HEAD_CHARS)} [... ${cut} characters cut ...] ${detail.slice(-LOG_TAIL_CHARS)}`;
+  }
+  return detail.replace(CONTROL_CHARACTERS, (ch) =>
+    ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : ch === "\t" ? "\\t" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+/**
+ * Whether a browser tool's error says the browser went away during the call. Playwright then appends the browser's
+ * log to the error, and that log is what tells an operator why (a crash, the out-of-memory killer, a missing
+ * library). Other failed calls (a timeout, a refused or unreachable address) are the caller's business and are not
+ * logged: their text holds the caller's URL.
+ */
+export function browserWentAway(err: unknown): boolean {
+  return err instanceof Error && /\nBrowser logs:|browser has been closed|Target crashed/i.test(err.message);
 }
 
 const CALLER_MESSAGE_CHARS = 300;
@@ -171,6 +201,9 @@ const CALLER_MESSAGE_CHARS = 300;
  * call log to its errors, and to a "browser has been closed" error the browser's log, which starts with the
  * executable's path and the whole command line (the proxy's port and the profile folder included). The first line
  * is the part a caller can use ("page.goto: Timeout 30000ms exceeded.", "URL not allowed ...").
+ *
+ * This removes what Playwright appends. It does not rewrite the first line: an error whose first line itself
+ * quotes something (an upstream API's error body, in grok-client.ts) still passes that on, up to the length cap.
  */
 export function callerErrorMessage(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
@@ -195,7 +228,9 @@ export interface SharedBrowser<B extends BrowserHandle> {
   get(): Promise<B>;
   /**
    * Close the browser, waiting first for a launch that is in flight when close is called. It is not final: a get()
-   * after it launches again. The server calls it once, at shutdown, after the calls in flight have drained.
+   * after it launches again. The server calls it once, at shutdown: after the calls in flight have drained, or with
+   * some still running when the shutdown grace runs out (one of those can then launch again; Playwright's own exit
+   * handler ends that browser with the process).
    */
   close(): Promise<void>;
 }
