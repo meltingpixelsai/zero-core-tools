@@ -28,6 +28,7 @@ import {
   paymentAuthority,
   paymentClaimKey,
   paymentTokenAuthority,
+  PREFLIGHT_FAILED,
   type FacilitatorClient,
   type SettleFirstConfig,
   type ToolResult,
@@ -137,6 +138,7 @@ function harness(opts: {
   claimsDir?: string;
   toolResult?: () => Promise<ToolResult>;
   precheck?: (args: { x?: string }) => string | null;
+  preflight?: (args: { x?: string }) => Promise<string | null> | string | null;
   events?: string[];
 } = {}): Harness {
   const events: string[] = opts.events ?? [];
@@ -180,7 +182,17 @@ function harness(opts: {
       extras.push(extra);
       return opts.toolResult ? opts.toolResult() : { content: [{ type: "text", text: "ok" }] };
     },
-    { precheck: opts.precheck },
+    {
+      precheck: opts.precheck,
+      ...(opts.preflight
+        ? {
+            preflight: async (args: { x?: string }) => {
+              events.push("preflight");
+              return opts.preflight?.(args) ?? null;
+            },
+          }
+        : {}),
+    },
   );
   const handler = tools.get("echo");
   assert.ok(handler, "tool registered");
@@ -402,6 +414,52 @@ test("a precheck refusal comes before any payment is asked for or taken", async 
   assert.deepEqual(h.events, []);
   assert.equal((await h.handler({ x: "good" }, paid(tok))).isError, undefined);
   assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "tool"]);
+});
+
+test("a preflight refusal comes after verify and before settle: nothing is taken, the tool does not run, and the payment can be used later", async () => {
+  let ready = false;
+  const h = harness({ preflight: () => (ready ? null : "Browser unavailable. No payment was taken. Try again later.") });
+  const tok = token("pay-15");
+  const refused = await h.handler({}, paid(tok));
+  assert.equal(refused.isError, true);
+  assert.equal(refused.content[0].text, "Error: Browser unavailable. No payment was taken. Try again later.");
+  assert.equal(refused._meta, undefined, "no payment response and no payment request ride on the refusal");
+  assert.deepEqual(paymentEvents(h.events), ["verify", "preflight"]);
+  assert.ok(h.logs.some((l) => l.includes("not ready, payment not settled, tool not run")));
+  // The claim was released: the same payment goes through once the dependency is back.
+  ready = true;
+  const second = await h.handler({}, paid(tok));
+  assert.equal(second.isError, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "preflight", "verify", "preflight", "settle", "tool"]);
+  // And having settled, it cannot be used again.
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+});
+
+test("the preflight never runs for a call without a payment, or with one that does not verify", async () => {
+  const h = harness({ preflight: () => "not ready", verify: async () => ({ isValid: false, invalidReason: "insufficient_funds", payer: "Payer1111" }) });
+  assert.equal(errorCode(await h.handler({}, {})), "PAYMENT_REQUIRED");
+  assert.equal(errorCode(await h.handler({}, paid("not-a-payment"))), "INVALID_PAYMENT");
+  assert.equal(errorCode(await h.handler({}, paid(token("pay-16")))), "insufficient_funds");
+  assert.deepEqual(paymentEvents(h.events), ["verify"], "only a verified payment sets the readiness check off");
+});
+
+test("a preflight that throws refuses the call the same way: nothing settled, claim released, cause in the log only", async () => {
+  let broken = true;
+  const h = harness({
+    preflight: () => {
+      if (broken) throw new Error("launcher exploded at /opt/secret/path");
+      return null;
+    },
+  });
+  const tok = token("pay-17");
+  const refused = await h.handler({}, paid(tok));
+  assert.equal(refused.isError, true);
+  assert.equal(refused.content[0].text, `Error: ${PREFLIGHT_FAILED}`);
+  assert.ok(!JSON.stringify(refused).includes("/opt/secret"), "the cause does not reach the caller");
+  assert.ok(h.logs.some((l) => l.includes("preflight check threw") && l.includes("/opt/secret/path")));
+  assert.deepEqual(paymentEvents(h.events), ["verify", "preflight"]);
+  broken = false;
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
 });
 
 test("a transaction without a message is refused before any facilitator call", async () => {

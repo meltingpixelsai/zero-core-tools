@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import dgram from "node:dgram";
 import dns from "node:dns";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
 import { startEgressProxy, type EgressProxy } from "./egress-proxy.js";
 import { __setInterfaceAddressesForTests, __setResolverForTests, resolvePublicAddresses } from "./ssrf.js";
 
@@ -307,6 +309,101 @@ test(
       await browser.close();
       await proxy.close();
       for (const s of servers) s.close();
+    }
+  },
+);
+
+// End-to-end: WebRTC must not send UDP around the proxy. A page's script names a STUN server (here, a UDP socket of
+// this test on one of the host's own addresses) and the test counts the packets that socket receives. The same page
+// runs twice: first with the production launch options minus WEBRTC_NO_DIRECT_UDP, where packets MUST arrive (that
+// run proves this test can see the leak on this host), then with the production options as they are, where none may.
+test(
+  "browser: WebRTC sends no UDP around the proxy (a STUN server the page names gets no packet)",
+  { skip: e2eBrowser ? false : "set SSRF_E2E_BROWSER=chromium|msedge|chrome to run" },
+  async () => {
+    const { chromium } = await import("playwright");
+    const { browserLaunchOptions, WEBRTC_NO_DIRECT_UDP } = await import("./browser.js");
+
+    const hostAddress = Object.values(os.networkInterfaces())
+      .flat()
+      .find((a) => a !== undefined && a.family === "IPv4" && !a.internal)?.address;
+    assert.ok(hostAddress, "this host has no IPv4 address besides loopback, so the test cannot stand in for a STUN server");
+
+    let packets = 0;
+    const stun = dgram.createSocket("udp4");
+    stun.on("message", () => packets++);
+    await new Promise<void>((r) => stun.bind(0, "0.0.0.0", () => r()));
+    const stunPort = stun.address().port;
+
+    const site = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<body>WEBRTC-PAGE</body>");
+    });
+    await new Promise<void>((r) => site.listen(0, "127.0.0.1", () => r()));
+    const sitePort = (site.address() as net.AddressInfo).port;
+
+    const proxy = await startEgressProxy(async (host) =>
+      host === "public.test" ? ["127.0.0.1"] : resolvePublicAddresses(host),
+    );
+    const production = browserLaunchOptions(proxy.url);
+    assert.ok((production.args ?? []).includes(WEBRTC_NO_DIRECT_UDP), "the production launch options carry the WebRTC policy");
+
+    /** Loads the page through the proxy, gathers ICE candidates against the STUN server, returns the packets seen. */
+    const gather = async (args: string[]): Promise<{ packets: number; candidates: string[] }> => {
+      packets = 0;
+      const browser = await chromium.launch({ ...production, args, channel: e2eBrowser });
+      try {
+        const page = await browser.newPage();
+        await page.goto(`http://public.test:${sitePort}/`, { waitUntil: "load", timeout: 15_000 });
+        const candidates = await page.evaluate(async (stunUrl: string) => {
+          const pc = new RTCPeerConnection({ iceServers: [{ urls: stunUrl }] });
+          const found: string[] = [];
+          pc.onicecandidate = (e) => {
+            if (e.candidate) found.push(e.candidate.candidate);
+          };
+          pc.createDataChannel("probe");
+          await pc.setLocalDescription(await pc.createOffer());
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 6_000);
+            pc.onicegatheringstatechange = () => {
+              if (pc.iceGatheringState === "complete") {
+                clearTimeout(timer);
+                resolve();
+              }
+            };
+          });
+          pc.close();
+          return found;
+        }, `stun:${hostAddress}:${stunPort}`);
+        // A late packet still counts.
+        await new Promise((r) => setTimeout(r, 500));
+        return { packets, candidates };
+      } finally {
+        await browser.close();
+      }
+    };
+
+    try {
+      const withoutPolicy = await gather((production.args ?? []).filter((a) => a !== WEBRTC_NO_DIRECT_UDP));
+      assert.ok(
+        withoutPolicy.packets > 0,
+        `control: without the policy the STUN server must get a packet, or this test proves nothing here (candidates: ${JSON.stringify(withoutPolicy.candidates)})`,
+      );
+      const withPolicy = await gather(production.args ?? []);
+      assert.equal(
+        withPolicy.packets,
+        0,
+        `with the policy the STUN server got ${withPolicy.packets} packet(s) (candidates: ${JSON.stringify(withPolicy.candidates)})`,
+      );
+      assert.deepEqual(
+        withPolicy.candidates.filter((c) => / udp /i.test(c)),
+        [],
+        "with the policy no UDP candidate is gathered",
+      );
+    } finally {
+      stun.close();
+      await proxy.close();
+      site.close();
     }
   },
 );

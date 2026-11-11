@@ -23,7 +23,7 @@ import {
   readCappedText,
 } from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
-import { closeBrowser } from "./lib/browser.js";
+import { BROWSER_UNAVAILABLE_UNPAID, browserReady, closeBrowser } from "./lib/browser.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -127,6 +127,16 @@ async function urlPrecheck({ url }: { url: string }): Promise<string | null> {
   }
 }
 
+/**
+ * Refuse a browser tool's call, with the payment verified but not yet settled, when the browser cannot be started
+ * (see browserReady in src/lib/browser.ts). Without it such a call was paid for and then answered with an error.
+ */
+async function browserPreflight(): Promise<string | null> {
+  return (await browserReady()) ? null : BROWSER_UNAVAILABLE_UNPAID;
+}
+
+const browserToolOptions = { precheck: urlPrecheck, preflight: browserPreflight };
+
 // mcp-handler serves all clients through one transport that knows a request
 // only by its JSON-RPC id, and every client numbers its requests from the
 // start, so two clients' calls with the same id could get each other's answers,
@@ -155,7 +165,7 @@ const createPaidHandler = () => createMcpPaidHandler(
           return toolError(err);
         }
       },
-      { precheck: urlPrecheck }
+      browserToolOptions
     );
 
     paidTool(
@@ -176,7 +186,7 @@ const createPaidHandler = () => createMcpPaidHandler(
           return toolError(err);
         }
       },
-      { precheck: urlPrecheck }
+      browserToolOptions
     );
 
     paidTool(
@@ -195,7 +205,7 @@ const createPaidHandler = () => createMcpPaidHandler(
           return toolError(err);
         }
       },
-      { precheck: urlPrecheck }
+      browserToolOptions
     );
 
     // ── Code review ──
