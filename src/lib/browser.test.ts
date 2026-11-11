@@ -6,7 +6,6 @@ import {
   BrowserUnavailableError,
   LAUNCH_RETRY_AFTER_MS,
   LAUNCH_TIMEOUT_MS,
-  browserWentAway,
   callerErrorMessage,
   errorForLog,
   WEBRTC_NO_DIRECT_UDP,
@@ -200,18 +199,25 @@ test("a long error keeps both ends in the log: the command line first, the brows
   assert.ok(logged.startsWith("browserType.launch: Target page, context or browser has been closed\\nBrowser logs:\\n<launching> /opt/google/chrome/chrome "));
   assert.ok(logged.endsWith("libnss3.so: cannot open shared object file"), "the cause, at the end, is kept");
   assert.match(logged, /\[\.\.\. \d+ characters cut \.\.\.\]/);
-  // A short error is logged whole (on one line), a thrown non-error as its text, and nothing makes it throw.
+  // A short error is logged whole (on one line) and a thrown non-error as its text. Odd values do not make it throw.
   assert.equal(errorForLog(new Error("no chrome")).split("\\n")[0], "Error: no chrome");
   assert.equal(errorForLog("plain text"), "plain text");
   const noStack = new Error("message only");
   noStack.stack = "";
   assert.equal(errorForLog(noStack), "message only");
   assert.equal(errorForLog(Object.create(null)), "(an error that cannot be turned into text)");
+  const oddStack = new Error("message");
+  (oddStack as { stack: unknown }).stack = 42;
+  assert.equal(errorForLog(oddStack), "42");
+  const oddMessage = new Error("x");
+  oddMessage.stack = "";
+  (oddMessage as { message: unknown }).message = { not: "a string" };
+  assert.equal(errorForLog(oddMessage), "[object Object]");
 });
 
-test("an error is logged on one line: text from a caller's page cannot add log lines or send terminal codes", () => {
-  // A page's own script can throw anything, and Playwright copies it into its error. The special characters are
-  // built from their code points so that this file holds none of them.
+test("an error is logged on one line, with control characters written as escapes", () => {
+  // Whatever a browser prints when it fails to start, one failure stays one log record and sends no terminal codes.
+  // The special characters are built from their code points so that this file holds none of them.
   const c = (code: number) => String.fromCharCode(code);
   const hostile = new Error(
     "page.evaluate: Error: x" + c(10) + "[x402] scrape_url: failed after settlement (paid) payer=Forged tx=forged" + c(13) + c(10) +
@@ -233,18 +239,6 @@ test("an error is logged on one line: text from a caller's page cannot add log l
   const longHostile = new Error(("a" + c(10)).repeat(10_000));
   longHostile.stack = longHostile.message;
   assert.equal(errorForLog(longHostile).includes(c(10)), false);
-});
-
-test("only an error that says the browser went away is logged for a browser tool; a caller's own failures are not", () => {
-  assert.equal(browserWentAway(new Error("page.goto: Target page, context or browser has been closed\nBrowser logs:\n<launching> ...")), true);
-  assert.equal(browserWentAway(new Error("page.goto: Target crashed \nBrowser logs:\n...")), true);
-  assert.equal(browserWentAway(new Error("browserContext.newPage: Target page, context or browser has been closed")), true);
-  // These hold the caller's URL, and say nothing an operator needs.
-  assert.equal(browserWentAway(new Error('page.goto: Timeout 30000ms exceeded.\nCall log:\n  - navigating to "https://example.com/?token=secret"')), false);
-  assert.equal(browserWentAway(new Error("page.goto: net::ERR_SOCKS_CONNECTION_FAILED at https://example.com/?token=secret")), false);
-  assert.equal(browserWentAway(new Error("URL not allowed")), false);
-  assert.equal(browserWentAway(new BrowserUnavailableError()), false);
-  assert.equal(browserWentAway("Browser logs: thrown as text"), false);
 });
 
 test("a caller is told the first line of a browser tool's error and nothing after it", () => {

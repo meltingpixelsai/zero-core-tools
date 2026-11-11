@@ -23,14 +23,7 @@ import {
   readCappedText,
 } from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
-import {
-  BROWSER_UNAVAILABLE_UNPAID,
-  browserReady,
-  browserWentAway,
-  callerErrorMessage,
-  closeBrowser,
-  errorForLog,
-} from "./lib/browser.js";
+import { BROWSER_UNAVAILABLE_UNPAID, browserReady, callerErrorMessage, closeBrowser } from "./lib/browser.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -47,11 +40,11 @@ function toolError(err: unknown) {
 
 /**
  * A browser tool's failure. The caller, who has paid, gets the first line of the error (callerErrorMessage in
- * src/lib/browser.ts says what the rest of a Playwright error can carry). When the error says the browser went away
- * during the call, it is also logged, on one line, with the browser's own log; other failures are not logged.
+ * src/lib/browser.ts says what the rest of a Playwright error can carry). The error is not logged here: its text
+ * can hold the caller's URL and words chosen by the caller's page. The payment layer logs that a paid call failed,
+ * and the browser module logs a launch failure and a browser that disconnected.
  */
-function browserToolError(tool: string, err: unknown) {
-  if (browserWentAway(err)) console.error(`[browser] ${tool}: the browser went away during the call: ${errorForLog(err)}`);
+function browserToolError(err: unknown) {
   return {
     content: [{ type: "text" as const, text: `Error: ${callerErrorMessage(err)}` }],
     isError: true as const,
@@ -182,7 +175,7 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await scrapeUrl(url, max_length ?? 10_000));
         } catch (err) {
-          return browserToolError("scrape_url", err);
+          return browserToolError(err);
         }
       },
       browserToolOptions
@@ -203,7 +196,7 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await screenshotUrl(url, full_page ?? true, width ?? 1280, height ?? 720));
         } catch (err) {
-          return browserToolError("screenshot_url", err);
+          return browserToolError(err);
         }
       },
       browserToolOptions
@@ -222,7 +215,7 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await extractStructuredData(url, schema_description));
         } catch (err) {
-          return browserToolError("extract_structured_data", err);
+          return browserToolError(err);
         }
       },
       browserToolOptions

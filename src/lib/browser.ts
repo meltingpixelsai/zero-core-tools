@@ -158,20 +158,21 @@ const LOG_TAIL_CHARS = 5_000;
 const CONTROL_CHARACTERS = new RegExp(`[\\x00-\\x1f\\x7f-\\x9f${String.fromCharCode(0x2028, 0x2029)}]`, "g");
 
 /**
- * An error's text for the server log: on ONE line, and cut in the middle when it is long.
+ * A launch error's text for the server log: on ONE line, and cut in the middle when it is long.
  *
- * One line, with every control character written as an escape, because part of the text can come from a caller's
- * page: an exception thrown by the page's own script is copied into Playwright's error. Logged as it is, such a
- * page could add lines of its own to the log (a made-up payment line, say) or send terminal escape codes to
- * whoever reads it.
+ * Only launch failures are logged through this (createSharedBrowser, below), and no page has been loaded when a
+ * launch fails, so the text is Playwright's and the browser's own. It is still written on one line with control
+ * characters as escapes, so that one failure is one log record whatever the browser printed. Do not pass it an error
+ * from a call that has loaded a caller's page without thinking again: such an error can hold text the page chose
+ * (an exception its script threw), and this does not escape invisible formatting characters.
  *
- * Cut in the middle, because Playwright's launch and closed-browser errors put the command line first and the
- * browser's own output, which names the cause, near the end (before the stack frames): both ends are kept.
+ * Cut in the middle, because Playwright's launch error puts the command line first and the browser's own output,
+ * which names the cause, near the end (before the stack frames): both ends are kept.
  */
 export function errorForLog(err: unknown): string {
   let detail: string;
   try {
-    detail = err instanceof Error ? err.stack || err.message : String(err);
+    detail = String(err instanceof Error ? err.stack || err.message : err);
   } catch {
     detail = "(an error that cannot be turned into text)";
   }
@@ -182,16 +183,6 @@ export function errorForLog(err: unknown): string {
   return detail.replace(CONTROL_CHARACTERS, (ch) =>
     ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : ch === "\t" ? "\\t" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
-}
-
-/**
- * Whether a browser tool's error says the browser went away during the call. Playwright then appends the browser's
- * log to the error, and that log is what tells an operator why (a crash, the out-of-memory killer, a missing
- * library). Other failed calls (a timeout, a refused or unreachable address) are the caller's business and are not
- * logged: their text holds the caller's URL.
- */
-export function browserWentAway(err: unknown): boolean {
-  return err instanceof Error && /\nBrowser logs:|browser has been closed|Target crashed/i.test(err.message);
 }
 
 const CALLER_MESSAGE_CHARS = 300;
@@ -311,6 +302,10 @@ async function launchBrowser(): Promise<Browser> {
   // One line per launch, so the log shows which build and version is really serving calls. The build name is read
   // from the options this launch was given, and the version is the one the browser itself reports.
   console.log(`[browser] launched ${options.channel ?? "bundled headless shell, no sandbox"} ${launched.version()}`);
+  // One fixed line when this browser goes away, whatever the reason: closed at shutdown, crashed, or killed. It
+  // comes from the browser's own disconnect event and holds no text from any error, so a caller's page cannot fake
+  // it or put words in it. Calls that were in flight fail with Playwright's own message; the next call launches again.
+  launched.on("disconnected", () => console.error("[browser] the browser disconnected"));
   return launched;
 }
 
