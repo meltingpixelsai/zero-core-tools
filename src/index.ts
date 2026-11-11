@@ -23,7 +23,7 @@ import {
   readCappedText,
 } from "./lib/request-guard.js";
 import { installGracefulShutdown } from "./lib/graceful-shutdown.js";
-import { closeBrowser } from "./lib/browser.js";
+import { BROWSER_UNAVAILABLE_UNPAID, browserReady, callerErrorMessage, closeBrowser } from "./lib/browser.js";
 
 // ── Shared tool callback helpers ─────────────────────────────
 
@@ -34,6 +34,19 @@ function toolResult(data: unknown) {
 function toolError(err: unknown) {
   return {
     content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+    isError: true as const,
+  };
+}
+
+/**
+ * A browser tool's failure. The caller, who has paid, gets the first line of the error (callerErrorMessage in
+ * src/lib/browser.ts says what the rest of a Playwright error can carry). The error is not logged here: its text
+ * can hold the caller's URL and words chosen by the caller's page. The payment layer logs that a paid call failed,
+ * and the browser module logs a launch failure and a browser that disconnected.
+ */
+function browserToolError(err: unknown) {
+  return {
+    content: [{ type: "text" as const, text: `Error: ${callerErrorMessage(err)}` }],
     isError: true as const,
   };
 }
@@ -127,6 +140,16 @@ async function urlPrecheck({ url }: { url: string }): Promise<string | null> {
   }
 }
 
+/**
+ * Refuse a browser tool's call, with the payment verified but not yet settled, when the browser cannot be started
+ * (see browserReady in src/lib/browser.ts). Without it such a call was paid for and then answered with an error.
+ */
+async function browserPreflight(): Promise<string | null> {
+  return (await browserReady()) ? null : BROWSER_UNAVAILABLE_UNPAID;
+}
+
+const browserToolOptions = { precheck: urlPrecheck, preflight: browserPreflight };
+
 // mcp-handler serves all clients through one transport that knows a request
 // only by its JSON-RPC id, and every client numbers its requests from the
 // start, so two clients' calls with the same id could get each other's answers,
@@ -152,10 +175,10 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await scrapeUrl(url, max_length ?? 10_000));
         } catch (err) {
-          return toolError(err);
+          return browserToolError(err);
         }
       },
-      { precheck: urlPrecheck }
+      browserToolOptions
     );
 
     paidTool(
@@ -173,10 +196,10 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await screenshotUrl(url, full_page ?? true, width ?? 1280, height ?? 720));
         } catch (err) {
-          return toolError(err);
+          return browserToolError(err);
         }
       },
-      { precheck: urlPrecheck }
+      browserToolOptions
     );
 
     paidTool(
@@ -192,10 +215,10 @@ const createPaidHandler = () => createMcpPaidHandler(
         try {
           return toolResult(await extractStructuredData(url, schema_description));
         } catch (err) {
-          return toolError(err);
+          return browserToolError(err);
         }
       },
-      { precheck: urlPrecheck }
+      browserToolOptions
     );
 
     // ── Code review ──

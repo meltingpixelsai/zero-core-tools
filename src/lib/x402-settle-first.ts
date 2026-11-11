@@ -14,6 +14,8 @@
  *   3. settle it;
  *   4. only then run the tool.
  * A payment that fails to settle releases its claim and never runs the tool.
+ * A tool may name a readiness check (`preflight`) for what it depends on; it
+ * runs between 2 and 3, and a refusal releases the claim and settles nothing.
  * Claims are marker files in one directory shared by every server that takes
  * the same wallet's payments (default ~/.x402-claims), so one payment sent to
  * several servers at once runs one tool, and a replay after a restart is
@@ -73,7 +75,19 @@ type ToolRegistrar = { tool: (...args: unknown[]) => unknown };
 export interface PaidToolOptions<A> {
   /** Cheap input checks that run before any payment is asked for or taken. Return a message to refuse the call. */
   precheck?: (args: A) => Promise<string | null> | string | null;
+  /**
+   * A readiness check for what the tool depends on (the browser, for the browser tools). It runs once the payment
+   * has been verified and before it is settled, so only a caller holding a valid payment can set it off. Return a
+   * message to refuse the call: the payment is then not settled and its claim is released, so the same payment can
+   * be presented again later. A check that throws refuses the call the same way. Keep the check short: a caller
+   * that gives up while it runs is still settled and the tool still runs, as for any call in flight (a cancellation
+   * is accepted and ignored, see request-guard.ts).
+   */
+  preflight?: (args: A) => Promise<string | null> | string | null;
 }
+
+/** What a caller is told when a preflight check throws instead of answering. */
+export const PREFLIGHT_FAILED = "The service is not ready for this call. No payment was taken. Try again later.";
 
 export interface SettleFirstDeps {
   facilitator?: FacilitatorClient;
@@ -511,6 +525,21 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           claims.release(key);
           refreshFeePayerSoon();
           return paymentRequired(verified.invalidReason ?? "INVALID_PAYMENT", { payer: verified.payer });
+        }
+
+        if (options.preflight) {
+          let notReady: string | null;
+          try {
+            notReady = await options.preflight(args);
+          } catch (err) {
+            log(`[x402] ${name}: preflight check threw, payment not settled: ${String(err)} payer=${payer}`);
+            notReady = PREFLIGHT_FAILED;
+          }
+          if (notReady) {
+            claims.release(key);
+            log(`[x402] ${name}: not ready, payment not settled, tool not run: ${notReady} payer=${payer}`);
+            return { isError: true, content: [{ type: "text", text: `Error: ${notReady}` }] };
+          }
         }
 
         let settled: SettleResponse;
