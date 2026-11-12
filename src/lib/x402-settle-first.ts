@@ -13,7 +13,15 @@
  *   2. verify it with the facilitator;
  *   3. settle it;
  *   4. only then run the tool.
- * A payment that fails to settle releases its claim and never runs the tool.
+ * A payment the facilitator definitely did not settle releases its claim and
+ * never runs the tool. A settlement without a final answer (no reply, a busy or
+ * failing facilitator, "settlement_pending") is not a failure: the payment may
+ * still be taken. The call asks again with the identical request, which the
+ * facilitator answers with the recorded outcome instead of paying twice. If no
+ * final answer comes in time the claim is KEPT, the caller is told the outcome
+ * is unknown and is not offered a new payment, and presenting the same payment
+ * with the same call later asks once more: the tool then runs, or the claim is
+ * released because nothing was taken.
  * A tool may name a readiness check (`preflight`) for what it depends on; it
  * runs between 2 and 3, and a refusal releases the claim and settles nothing.
  * Claims are marker files in one directory shared by every server that takes
@@ -29,12 +37,12 @@
  * Requirement building and payment-token parsing follow mcpay 0.1.17
  * (MIT License, Copyright (c) MCPay). Solana ("svm") recipients only.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { decodePayment } from "x402/schemes";
-import { findMatchingPaymentRequirements, processPriceToAtomicAmount } from "x402/shared";
+import { findMatchingPaymentRequirements, processPriceToAtomicAmount, toJsonSafe } from "x402/shared";
 import { SupportedSVMNetworks } from "x402/types";
 import type { PaymentPayload, PaymentRequirements, SettleResponse, VerifyResponse } from "x402/types";
 import { useFacilitator } from "x402/verify";
@@ -63,9 +71,29 @@ export interface X402Settlement {
   network: string;
 }
 
+/**
+ * A settle reply as a facilitator may really send it (its reason codes are not limited to the ones x402's types
+ * list), with the HTTP status it came with (absent when a facilitator object returns the reply directly).
+ */
+export interface SettleReply {
+  success?: boolean;
+  errorReason?: string;
+  transaction?: string;
+  network?: string;
+  payer?: string;
+  httpStatus?: number;
+}
+
 export interface FacilitatorClient {
   verify: (payload: PaymentPayload, requirements: PaymentRequirements) => Promise<VerifyResponse>;
   settle: (payload: PaymentPayload, requirements: PaymentRequirements) => Promise<SettleResponse>;
+  /**
+   * One settle request with exactly this body, answered within `timeoutMs`. It resolves with the facilitator's
+   * reply and HTTP status whatever the status is, and rejects only when no reply came (network error, timeout).
+   * Optional: without it `settle` is called with the body's payment and requirements, and a rejection counts as
+   * no reply.
+   */
+  settleBody?: (body: string, timeoutMs: number) => Promise<SettleReply>;
   supported: () => Promise<{ kinds: Array<{ scheme: string; network: string; extra?: Record<string, unknown> }> }>;
 }
 
@@ -82,6 +110,10 @@ export interface PaidToolOptions<A> {
    * be presented again later. A check that throws refuses the call the same way. Keep the check short: a caller
    * that gives up while it runs is still settled and the tool still runs, as for any call in flight (a cancellation
    * is accepted and ignored, see request-guard.ts).
+   *
+   * A call that resumes a settlement an earlier call left unresolved runs the check too, before the facilitator is
+   * asked again. That payment may already be taken, so a refusal there promises nothing: the settlement stays as it
+   * is, the check's own message is not passed on, and the caller is told to present the payment again later.
    */
   preflight?: (args: A) => Promise<string | null> | string | null;
 }
@@ -97,10 +129,94 @@ export interface SettleFirstDeps {
   log?: (line: string) => void;
   /** Startup information (the claim directory in use). Default: console.log */
   info?: (line: string) => void;
+  /** The wait between two settle requests for one payment. Default: a timer. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/** The error code of a call whose payment may or may not have been taken. Its result offers no new payment. */
+export const SETTLEMENT_UNRESOLVED = "SETTLEMENT_UNRESOLVED";
 
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
 const PRUNE_EVERY_MS = 10 * 60 * 1000;
+/**
+ * How long a call keeps asking for the outcome of the settlement it started, counted from its first request. Most
+ * MCP clients give a call 60 seconds, so the caller is answered while it still listens.
+ */
+const SETTLE_BUDGET_MS = 45 * 1000;
+/** The same for a call that presents a payment whose settlement an earlier call left unresolved. */
+const SETTLE_AGAIN_BUDGET_MS = 20 * 1000;
+/** No settle request is given less time than this, however little of the budget is left. */
+const SETTLE_REQUEST_MIN_MS = 3 * 1000;
+/** Waits between the settle requests of one call; the last one repeats. */
+const SETTLE_ASK_AGAIN_DELAYS_MS = [2_000, 3_000, 5_000, 10_000];
+/** A bound on one call's settle requests that does not depend on the clock. */
+const SETTLE_MAX_REQUESTS = 12;
+/**
+ * A claim still marked "settling" after this long was left by a process that is gone (a call holds one for
+ * SETTLE_BUDGET_MS plus one request at most), so a later call may ask the facilitator about it.
+ */
+const SETTLING_STALE_MS = 10 * 60 * 1000;
+/** A claim's lock is held for a few file operations; one this old was left by a process that died holding it. */
+const LOCK_STALE_MS = 60 * 1000;
+const END_CLAIM_TRIES = 20;
+const END_CLAIM_WAIT_MS = 50;
+/** What the caller of an unresolved settlement is told to wait before presenting the payment again. */
+const UNRESOLVED_RETRY_SECONDS = 30;
+/** A settle request body holds one payment token's content and one requirement; a stored one longer is not ours. */
+const MAX_SETTLE_BODY_LENGTH = 16 * 1024;
+
+/**
+ * Settle replies that are not a final answer: the payment may still be taken, or already was. The first four are
+ * PayAI's (its API description: "treat this as unresolved, not failed, and re-submit the identical body"); the last
+ * two are what x402's reference facilitator answers once it has sent the transaction.
+ */
+const UNRESOLVED_REASONS = new Set([
+  "settlement_pending",
+  "duplicate_settlement",
+  "idempotency_key_in_flight",
+  "internal_server_error",
+  "service_unavailable",
+  "unexpected_settle_error",
+  "settle_exact_svm_transaction_confirmation_timed_out",
+]);
+
+const UNRESOLVED_MESSAGE =
+  "This payment was sent for settlement and the outcome is not known yet: it may still be taken. Do not send a new payment for this call. " +
+  "Present the same payment with the same call again to get the result, or a definite answer that nothing was taken.";
+const IN_PROGRESS_MESSAGE =
+  "An earlier call is still settling this payment. Do not send a new payment for this call. Present the same payment with the same call again shortly.";
+const NOT_READY_MESSAGE =
+  "The service is not ready to run this call yet, and the outcome of its payment is not known. Do not send a new payment for this call. " +
+  "Present the same payment with the same call again later.";
+
+/** A claim's record. `o` marks the call that owns a settlement in progress; `call` and `body` let a later call resume it. */
+type ClaimRecord =
+  | { s: "pending"; t: number }
+  | { s: "settling"; t: number; o: string; call: string; body: string; tx?: string }
+  | { s: "unresolved"; t: number; call: string; body: string; tx?: string }
+  | { s: "settled"; t: number; tx?: string };
+
+/** How the call that owns a settlement ends it. */
+type ClaimEnd = { s: "settled"; tx: string } | { s: "unresolved"; tx: string } | { s: "released" };
+
+function parseClaim(text: string): ClaimRecord | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== "object") return null;
+  const rec = value as Record<string, unknown>;
+  if (typeof rec.t !== "number") return null;
+  const tx = typeof rec.tx === "string" ? { tx: rec.tx } : {};
+  if (rec.s === "pending") return { s: "pending", t: rec.t };
+  if (rec.s === "settled") return { s: "settled", t: rec.t, ...tx };
+  if (typeof rec.call !== "string" || typeof rec.body !== "string" || rec.body.length > MAX_SETTLE_BODY_LENGTH) return null;
+  if (rec.s === "unresolved") return { s: "unresolved", t: rec.t, call: rec.call, body: rec.body, ...tx };
+  if (rec.s === "settling" && typeof rec.o === "string") return { s: "settling", t: rec.t, o: rec.o, call: rec.call, body: rec.body, ...tx };
+  return null;
+}
 const FEE_PAYER_TTL_MS = 10 * 60 * 1000;
 /** A failed verify may mean the facilitator rotated its fee payer, but refresh at most this often. */
 const FEE_PAYER_REFRESH_MIN_MS = 30 * 1000;
@@ -155,11 +271,152 @@ export class ClaimStore {
     return true;
   }
 
-  markSettled(key: string, transaction: string): void {
+  private lockFile(key: string): string {
+    return this.file(key).slice(0, -".claim".length) + ".lock";
+  }
+
+  private read(key: string): ClaimRecord | null {
     try {
-      fs.writeFileSync(this.file(key), JSON.stringify({ s: "settled", t: this.now(), tx: transaction }), { mode: 0o600 });
+      return parseClaim(fs.readFileSync(this.file(key), "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  /** Replaces the claim's record in one step: written beside it, then renamed over it. */
+  private write(key: string, record: ClaimRecord): void {
+    const file = this.file(key);
+    const tmp = `${file}.${randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(record), { mode: 0o600, flag: "wx" });
+      fs.renameSync(tmp, file);
     } catch (err) {
-      this.log(`[x402] could not mark claim settled (claim still held): ${String(err)}`);
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // It was never written.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Runs `change` holding the claim's lock, so that reading a claim and then replacing it is one step for every
+   * process that shares the directory. `change` must not wait for anything. Returns null when another process holds
+   * the lock right now.
+   */
+  private locked<T>(key: string, change: () => T): { value: T } | null {
+    const lock = this.lockFile(key);
+    const take = (): number | null => {
+      try {
+        return fs.openSync(lock, "wx", 0o600);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") return null;
+        throw err;
+      }
+    };
+    let fd = take();
+    if (fd === null) {
+      // A live holder keeps the lock for a few file operations. One this old died holding it: clear it once.
+      try {
+        if (this.now() - fs.statSync(lock).mtimeMs <= LOCK_STALE_MS) return null;
+        fs.unlinkSync(lock);
+      } catch {
+        return null;
+      }
+      fd = take();
+      if (fd === null) return null;
+    }
+    try {
+      return { value: change() };
+    } finally {
+      fs.closeSync(fd);
+      try {
+        fs.unlinkSync(lock);
+      } catch {
+        // Already cleared as stale by another process.
+      }
+    }
+  }
+
+  /**
+   * The claimant has verified the payment and is about to send it for settlement: record the call and the exact
+   * request, so the settlement can be resumed if this call cannot finish it. Returns the mark that makes this call
+   * the settlement's owner, or null when the record could not be written (nothing has been sent then).
+   */
+  markSettling(key: string, call: string, body: string): string | null {
+    const owner = randomUUID();
+    try {
+      this.write(key, { s: "settling", t: this.now(), o: owner, call, body });
+      return owner;
+    } catch (err) {
+      this.log(`[x402] could not record a settlement before sending it: ${String(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * What a call that presents an already claimed payment may do:
+   *   "used"   the payment is in use or was used (also: a different call, or a record this code cannot read);
+   *   "open"   another call owns this call's settlement right now;
+   *   "resume" the settlement was left unresolved (or its owner is gone): this call may ask about it again.
+   * Reads only.
+   */
+  heldFor(key: string, call: string): "used" | "open" | "resume" {
+    const rec = this.read(key);
+    if (!rec || (rec.s !== "settling" && rec.s !== "unresolved") || rec.call !== call) return "used";
+    return rec.s === "settling" && this.now() - rec.t < SETTLING_STALE_MS ? "open" : "resume";
+  }
+
+  /**
+   * Makes the calling call the owner of a settlement that `heldFor` reports as "resume". Returns the owner mark, the
+   * request to send again and the transaction the facilitator named (if any); or "open" / "used" when another call
+   * got there first.
+   */
+  takeOver(key: string, call: string): { owner: string; body: string; tx: string } | "open" | "used" {
+    let taken: { value: { owner: string; body: string; tx: string } | "open" | "used" } | null;
+    try {
+      taken = this.locked(key, () => {
+        const state = this.heldFor(key, call);
+        if (state !== "resume") return state;
+        const rec = this.read(key) as Extract<ClaimRecord, { s: "settling" | "unresolved" }>;
+        const owner = randomUUID();
+        this.write(key, { s: "settling", t: this.now(), o: owner, call, body: rec.body, ...(rec.tx ? { tx: rec.tx } : {}) });
+        return { owner, body: rec.body, tx: rec.tx ?? "" };
+      });
+    } catch (err) {
+      this.log(`[x402] could not take over an unresolved settlement: ${String(err)}`);
+      return "open";
+    }
+    if (taken) return taken.value;
+    // Another process is changing this claim right now.
+    return this.heldFor(key, call) === "used" ? "used" : "open";
+  }
+
+  /**
+   * Ends a settlement, if `owner` still owns it: the claim becomes settled, or unresolved (kept, resumable), or is
+   * released (deleted). "lost": another call has taken the settlement over, and this call must not act on its
+   * outcome. "busy": another process holds the lock right now, try again. "error": the record could not be changed
+   * (the claim is still held).
+   */
+  end(key: string, owner: string, end: ClaimEnd): "done" | "lost" | "busy" | "error" {
+    try {
+      const ended = this.locked(key, (): "done" | "lost" => {
+        const rec = this.read(key);
+        if (!rec || rec.s !== "settling" || rec.o !== owner) return "lost";
+        if (end.s === "released") fs.unlinkSync(this.file(key));
+        else if (end.s === "settled") this.write(key, { s: "settled", t: this.now(), tx: end.tx });
+        else {
+          // A transaction the facilitator named earlier stays on record when its later replies name none.
+          const tx = end.tx || rec.tx;
+          this.write(key, { s: "unresolved", t: this.now(), call: rec.call, body: rec.body, ...(tx ? { tx } : {}) });
+        }
+        return "done";
+      });
+      return ended ? ended.value : "busy";
+    } catch (err) {
+      this.log(`[x402] could not record a settlement's outcome (claim still held): ${String(err)}`);
+      return "error";
     }
   }
 
@@ -177,17 +434,21 @@ export class ClaimStore {
     return fs.existsSync(this.file(key));
   }
 
-  /** Delete claims older than 24 hours; their payments can no longer settle. */
+  /**
+   * Delete claims older than 24 hours (their payments can no longer settle, and the facilitator keeps an outcome
+   * that long), and locks and half-written records a process left behind when it died.
+   */
   private pruneOccasionally(): void {
     const now = this.now();
     if (now - this.lastPrune < PRUNE_EVERY_MS) return;
     this.lastPrune = now;
     try {
       for (const name of fs.readdirSync(this.dir)) {
-        if (!name.endsWith(".claim")) continue;
+        const maxAge = name.endsWith(".claim") ? CLAIM_TTL_MS : name.endsWith(".lock") || name.endsWith(".tmp") ? LOCK_STALE_MS : null;
+        if (maxAge === null) continue;
         const file = path.join(this.dir, name);
         try {
-          if (now - fs.statSync(file).mtimeMs > CLAIM_TTL_MS) fs.unlinkSync(file);
+          if (now - fs.statSync(file).mtimeMs > maxAge) fs.unlinkSync(file);
         } catch {
           // Another process pruned or released it first.
         }
@@ -369,6 +630,99 @@ function errorResult(payload: Record<string, unknown>): ToolResult {
   };
 }
 
+/** One line of printable ASCII, cut short: what a reply or an error may put into a log line. */
+function brief(text: string): string {
+  return text.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, 160);
+}
+
+/** A Solana transaction signature as the facilitator names it, or "" for anything else. */
+function signatureOf(value: unknown): string {
+  return typeof value === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,128}$/.test(value) ? value : "";
+}
+
+/** Object keys in sorted order, so one call's arguments always give one text. */
+function canonicalJson(value: unknown, depth = 0): string {
+  if (depth > 32 || value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return "[" + value.map((item) => canonicalJson(item, depth + 1)).join(",") + "]";
+  const record = value as Record<string, unknown>;
+  const fields = Object.keys(record)
+    .filter((name) => record[name] !== undefined)
+    .sort()
+    .map((name) => JSON.stringify(name) + ":" + canonicalJson(record[name], depth + 1));
+  return "{" + fields.join(",") + "}";
+}
+
+/**
+ * Names one call: the tool and its arguments. An unresolved settlement is resumed only by the call that started it,
+ * because once a payment is on chain anyone can read it there and present it, but only its payer knows the call.
+ */
+export function paidCallId(name: string, args: unknown): string {
+  return createHash("sha256").update(name).update("\n").update(canonicalJson(args)).digest("hex");
+}
+
+export type SettleOutcome =
+  | { kind: "settled"; transaction: string; network: string }
+  | { kind: "failed"; reason: string; transaction: string }
+  | { kind: "unresolved"; reason: string; transaction: string };
+
+/**
+ * What one settle reply means. "failed" is only a definite answer that nothing was taken: HTTP 200 with
+ * success false and a reason that is final. A request the facilitator turned down outright (HTTP 4xx) is final too,
+ * but only for a payment's FIRST request: for a later one it says nothing about what the first one did. Everything
+ * else (a busy or failing facilitator, "settlement_pending", a reply that cannot be read) leaves the outcome open.
+ */
+export function classifySettle(reply: SettleReply, first: boolean): SettleOutcome {
+  const status = typeof reply.httpStatus === "number" ? reply.httpStatus : 200;
+  const reason = typeof reply.errorReason === "string" ? reply.errorReason : "";
+  const transaction = typeof reply.transaction === "string" ? reply.transaction : "";
+  if (reply.success === true && status === 200) {
+    return { kind: "settled", transaction, network: typeof reply.network === "string" ? reply.network : "" };
+  }
+  const open = reply.success === true || UNRESOLVED_REASONS.has(reason) || status >= 500 || [408, 409, 425, 429].includes(status);
+  if (!open) {
+    if (status === 200 && reply.success === false) return { kind: "failed", reason: reason || "SETTLEMENT_FAILED", transaction };
+    if (first && status >= 400 && status < 500) return { kind: "failed", reason: reason || "SETTLEMENT_FAILED", transaction };
+  }
+  return { kind: "unresolved", reason: reason || (status === 200 ? "unreadable reply" : `HTTP ${status}`), transaction };
+}
+
+/**
+ * One settle request with exactly `body`. Unlike x402's `useFacilitator().settle`, it gives the reply for every HTTP
+ * status (the facilitator answers JSON on 4xx and 5xx too) and stops waiting after `timeoutMs`.
+ */
+export async function postSettle(url: string, body: string, timeoutMs: number, fetchFn: typeof fetch = fetch): Promise<SettleReply> {
+  const res = await fetchFn(`${url}/settle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  let data: unknown = null;
+  try {
+    data = await res.json();
+  } catch {
+    // Not JSON: the status alone decides.
+  }
+  const reply = data !== null && typeof data === "object" && !Array.isArray(data) ? (data as SettleReply) : {};
+  return { ...reply, httpStatus: res.status };
+}
+
+function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no reply within ${Math.round(timeoutMs / 1000)} s`)), timeoutMs);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 /**
  * Build a paid-tool registrar. Create it once per process (it holds the claim
  * store), then bind it to each MCP server instance: `settleFirst(server)`.
@@ -381,10 +735,55 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
   const x402Version = cfg.version ?? 1;
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((line: string) => console.warn(line));
-  const facilitator: FacilitatorClient = deps.facilitator ?? (useFacilitator(cfg.facilitator) as FacilitatorClient);
+  const facilitator: FacilitatorClient = deps.facilitator ?? {
+    ...(useFacilitator(cfg.facilitator) as FacilitatorClient),
+    settleBody: (body, timeoutMs) => postSettle(cfg.facilitator.url, body, timeoutMs),
+  };
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const claimsDir = deps.claimsDir ?? (process.env.X402_CLAIMS_DIR || path.join(os.homedir(), ".x402-claims"));
   const claims = new ClaimStore(claimsDir, now, log);
   (deps.info ?? ((line: string) => console.log(line)))(`[x402] settle-first paid tools; payment claims in ${claimsDir}`);
+
+  async function sendSettle(body: string, timeoutMs: number): Promise<SettleReply> {
+    if (facilitator.settleBody) return facilitator.settleBody(body, timeoutMs);
+    const sent = JSON.parse(body) as { paymentPayload: PaymentPayload; paymentRequirements: PaymentRequirements };
+    return withTimeout(facilitator.settle(sent.paymentPayload, sent.paymentRequirements), timeoutMs);
+  }
+
+  /**
+   * Asks the facilitator to settle `body` until it gives a final answer or the call's time for this is used up.
+   * Every request carries the identical body: the facilitator settles a payment once and answers a repeat with the
+   * recorded outcome. `again`: an earlier call already sent this body, so no reply here is a first request's;
+   * `known` is the transaction the facilitator named to that call, if it named one.
+   */
+  async function resolveSettlement(body: string, again: boolean, known: string): Promise<SettleOutcome> {
+    const deadline = now() + (again ? SETTLE_AGAIN_BUDGET_MS : SETTLE_BUDGET_MS);
+    let transaction = known;
+    for (let sent = 0; ; sent++) {
+      let outcome: SettleOutcome;
+      try {
+        outcome = classifySettle(await sendSettle(body, Math.max(SETTLE_REQUEST_MIN_MS, deadline - now())), !again && sent === 0);
+      } catch (err) {
+        outcome = { kind: "unresolved", reason: `no reply (${brief(String(err))})`, transaction: "" };
+      }
+      if (outcome.kind !== "unresolved") return outcome;
+      transaction = outcome.transaction || transaction;
+      const wait = SETTLE_ASK_AGAIN_DELAYS_MS[Math.min(sent, SETTLE_ASK_AGAIN_DELAYS_MS.length - 1)];
+      if (sent + 1 >= SETTLE_MAX_REQUESTS || now() + wait >= deadline) return { ...outcome, transaction };
+      await sleep(wait);
+    }
+  }
+
+  /** Records how the settlement this call owns ended. The lock it needs is held by others for moments only. */
+  async function endClaim(key: string, owner: string, end: ClaimEnd): Promise<"done" | "lost" | "error"> {
+    for (let tries = 0; tries < END_CLAIM_TRIES; tries++) {
+      const ended = claims.end(key, owner, end);
+      if (ended !== "busy") return ended;
+      await sleep(END_CLAIM_WAIT_MS);
+    }
+    log("[x402] could not record a settlement's outcome (claim still held): its lock stayed taken");
+    return "error";
+  }
 
   let feePayerCache: { at: number; byNetwork: Map<string, string> } | null = null;
   let lastFeePayerRefresh = -Infinity;
@@ -504,6 +903,60 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         const feePayer = (selected.extra as { feePayer?: unknown } | undefined)?.feePayer;
         if (!key || !payer || payer === feePayer) return paymentRequired("INVALID_PAYMENT");
 
+        const call = paidCallId(name, args);
+        /** The outcome of the payment is not known. No `accepts`: a client must not be led to pay a second time. */
+        const unresolved = (transaction: string, message = UNRESOLVED_MESSAGE): ToolResult =>
+          errorResult({
+            x402Version,
+            error: SETTLEMENT_UNRESOLVED,
+            message,
+            ...(signatureOf(transaction) ? { transaction } : {}),
+            retryAfterSeconds: UNRESOLVED_RETRY_SECONDS,
+          });
+
+        /** Settles the payment whose settlement this call owns, then runs the tool. */
+        const settleAndRun = async (owner: string, body: string, again: boolean, known = ""): Promise<ToolResult> => {
+          const outcome = await resolveSettlement(body, again, known);
+          const tx = brief(outcome.transaction) || "-";
+          if (outcome.kind === "failed") {
+            const ended = await endClaim(key, owner, { s: "released" });
+            log(`[x402] ${name}: settle failed, tool not run: reason=${brief(outcome.reason)} tx=${tx} payer=${payer}`);
+            return ended === "lost" ? unresolved(outcome.transaction) : paymentRequired(outcome.reason);
+          }
+          if (outcome.kind === "unresolved") {
+            await endClaim(key, owner, { s: "unresolved", tx: signatureOf(outcome.transaction) });
+            log(`[x402] ${name}: settlement unresolved, claim kept, tool not run: reason=${brief(outcome.reason)} tx=${tx} payer=${payer}`);
+            return unresolved(outcome.transaction);
+          }
+          if ((await endClaim(key, owner, { s: "settled", tx: outcome.transaction })) === "lost") {
+            log(`[x402] ${name}: settled, but a later call took this settlement over and answers for it: tx=${tx} payer=${payer}`);
+            return unresolved(outcome.transaction);
+          }
+
+          const settlement: X402Settlement = {
+            payer,
+            transaction: outcome.transaction,
+            network: outcome.network,
+          };
+          let result: ToolResult;
+          let failed = false;
+          try {
+            result = await cb(args, { ...(extra as Record<string, unknown>), x402Settlement: settlement });
+            if (!result || typeof result !== "object") {
+              result = { isError: true, content: [{ type: "text", text: "Tool execution failed: no result" }] };
+            }
+            failed = result.isError === true;
+          } catch (err) {
+            failed = true;
+            result = { isError: true, content: [{ type: "text", text: `Tool execution failed: ${String(err)}` }] };
+          }
+          result._meta = { ...(result._meta ?? {}), "x402/payment-response": { success: true, ...settlement } };
+          if (failed) {
+            log(`[x402] ${name}: failed after settlement (paid) payer=${payer} tx=${settlement.transaction}`);
+          }
+          return result;
+        };
+
         let claimed: boolean;
         try {
           claimed = claims.tryClaim(key);
@@ -511,7 +964,31 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           log(`[x402] ${name}: payment claim store unavailable, payment refused unpaid: ${String(err)}`);
           return paymentRequired("PAYMENT_CLAIM_UNAVAILABLE");
         }
-        if (!claimed) return paymentRequired("PAYMENT_ALREADY_USED");
+        if (!claimed) {
+          // The payment is claimed. Unless this very call left its settlement unresolved, it is in use or used up.
+          const held = claims.heldFor(key, call);
+          if (held === "used") return paymentRequired("PAYMENT_ALREADY_USED");
+          if (held === "open") return unresolved("", IN_PROGRESS_MESSAGE);
+          if (options.preflight) {
+            // The payment may already be taken, so nothing is promised here: the settlement stays as it is.
+            let notReady: string | null;
+            try {
+              notReady = await options.preflight(args);
+            } catch (err) {
+              log(`[x402] ${name}: preflight check threw, unresolved settlement left as it is: ${String(err)} payer=${payer}`);
+              notReady = PREFLIGHT_FAILED;
+            }
+            if (notReady) {
+              log(`[x402] ${name}: not ready, unresolved settlement left as it is, tool not run: ${notReady} payer=${payer}`);
+              return unresolved("", NOT_READY_MESSAGE);
+            }
+          }
+          const taken = claims.takeOver(key, call);
+          if (taken === "used") return paymentRequired("PAYMENT_ALREADY_USED");
+          if (taken === "open") return unresolved("", IN_PROGRESS_MESSAGE);
+          log(`[x402] ${name}: asking again about an unresolved settlement: tx=${brief(taken.tx) || "-"} payer=${payer}`);
+          return settleAndRun(taken.owner, taken.body, true, taken.tx);
+        }
 
         let verified: VerifyResponse;
         try {
@@ -542,45 +1019,19 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           }
         }
 
-        let settled: SettleResponse;
-        try {
-          settled = await facilitator.settle(decoded, selected);
-        } catch (err) {
+        // The exact request is recorded before it is sent, so the settlement can be resumed whatever happens to this call.
+        const body = JSON.stringify({
+          x402Version: decoded.x402Version,
+          paymentPayload: toJsonSafe(decoded),
+          paymentRequirements: toJsonSafe(selected),
+        });
+        const owner = claims.markSettling(key, call, body);
+        if (!owner) {
           claims.release(key);
-          log(`[x402] ${name}: settle request failed, tool not run: ${String(err)} payer=${payer}`);
-          return paymentRequired("SETTLEMENT_FAILED");
+          log(`[x402] ${name}: payment claim store unavailable, payment not sent for settlement, tool not run payer=${payer}`);
+          return paymentRequired("PAYMENT_CLAIM_UNAVAILABLE");
         }
-        if (!settled.success) {
-          claims.release(key);
-          log(
-            `[x402] ${name}: settle failed, tool not run: reason=${settled.errorReason ?? "?"} tx=${settled.transaction || "-"} payer=${payer}`,
-          );
-          return paymentRequired(settled.errorReason ?? "SETTLEMENT_FAILED");
-        }
-        claims.markSettled(key, settled.transaction);
-
-        const settlement: X402Settlement = {
-          payer,
-          transaction: settled.transaction,
-          network: settled.network,
-        };
-        let result: ToolResult;
-        let failed = false;
-        try {
-          result = await cb(args, { ...(extra as Record<string, unknown>), x402Settlement: settlement });
-          if (!result || typeof result !== "object") {
-            result = { isError: true, content: [{ type: "text", text: "Tool execution failed: no result" }] };
-          }
-          failed = result.isError === true;
-        } catch (err) {
-          failed = true;
-          result = { isError: true, content: [{ type: "text", text: `Tool execution failed: ${String(err)}` }] };
-        }
-        result._meta = { ...(result._meta ?? {}), "x402/payment-response": { success: true, ...settlement } };
-        if (failed) {
-          log(`[x402] ${name}: failed after settlement (paid) payer=${payer} tx=${settlement.transaction}`);
-        }
-        return result;
+        return settleAndRun(owner, body, false);
       });
     };
   };
