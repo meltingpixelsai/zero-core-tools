@@ -193,8 +193,9 @@ const IN_PROGRESS_MESSAGE =
 const NOT_RECORDED_MESSAGE =
   "This payment was settled, but the call could not be recorded as paid, so it was not run. Do not send a new payment for this call. " +
   "Present the same payment with the same call again after the time given to get the result.";
-const CLAIM_UNAVAILABLE_MESSAGE =
-  "The service cannot record payments right now, so this call sent nothing for settlement. Present the same payment with the same call again later.";
+const CLAIM_UNAVAILABLE_MESSAGE = "The service cannot record payments right now, so this call sent nothing for settlement. Try again later.";
+const CLAIM_UNREADABLE_MESSAGE =
+  "The service cannot read this payment's record right now. Do not send a new payment for this call. Present the same payment with the same call again later.";
 const NOT_READY_MESSAGE =
   "The service is not ready to run this call yet, and the outcome of its payment is not known. Do not send a new payment for this call. " +
   "Present the same payment with the same call again later.";
@@ -207,12 +208,18 @@ const NOT_READY_MESSAGE =
  */
 type ClaimRecord =
   | { s: "pending"; t: number; call?: string }
-  | { s: "settling"; t: number; f: number; o: string; call: string; body: string; tx?: string }
-  | { s: "unresolved"; t: number; f: number; call: string; body: string; tx?: string }
+  | { s: "settling"; t: number; f: number; o: string; call: string; body: string; tx?: string; paid?: PaidMark }
+  | { s: "unresolved"; t: number; f: number; call: string; body: string; tx?: string; paid?: PaidMark }
   | { s: "settled"; t: number; tx?: string };
 
+/**
+ * The facilitator has answered that the payment settled, and the tool has not run: the claim could not be marked
+ * settled then. A call that resumes such a claim needs no further answer from the facilitator.
+ */
+type PaidMark = { tx: string; network: string };
+
 /** How the call that owns a settlement ends it. */
-type ClaimEnd = { s: "settled"; tx: string } | { s: "unresolved"; tx: string } | { s: "released" };
+type ClaimEnd = { s: "settled"; tx: string } | { s: "unresolved"; tx: string; paid?: PaidMark } | { s: "released" };
 
 function parseClaim(text: string): ClaimRecord | null {
   let value: unknown;
@@ -229,8 +236,10 @@ function parseClaim(text: string): ClaimRecord | null {
   if (rec.s === "settled") return { s: "settled", t: rec.t, ...tx };
   if (typeof rec.call !== "string" || typeof rec.f !== "number") return null;
   if (typeof rec.body !== "string" || rec.body.length > MAX_SETTLE_BODY_LENGTH) return null;
-  if (rec.s === "unresolved") return { s: "unresolved", t: rec.t, f: rec.f, call: rec.call, body: rec.body, ...tx };
-  if (rec.s === "settling" && typeof rec.o === "string") return { s: "settling", t: rec.t, f: rec.f, o: rec.o, call: rec.call, body: rec.body, ...tx };
+  const mark = rec.paid as { tx?: unknown; network?: unknown } | null | undefined;
+  const paid = mark && typeof mark === "object" && typeof mark.tx === "string" && typeof mark.network === "string" ? { paid: { tx: mark.tx, network: mark.network } } : {};
+  if (rec.s === "unresolved") return { s: "unresolved", t: rec.t, f: rec.f, call: rec.call, body: rec.body, ...tx, ...paid };
+  if (rec.s === "settling" && typeof rec.o === "string") return { s: "settling", t: rec.t, f: rec.f, o: rec.o, call: rec.call, body: rec.body, ...tx, ...paid };
   return null;
 }
 const FEE_PAYER_TTL_MS = 10 * 60 * 1000;
@@ -350,23 +359,13 @@ export class ClaimStore {
       return true;
     };
     if (!take()) {
-      // A live holder keeps the lock for a few file operations. One this old died holding it: clear it once. The
-      // lock is moved aside first and looked at again, so a lock another process took in the meantime is put back
-      // and not deleted.
-      const aside = `${lock}.${mine}.tmp`;
+      // A live holder keeps the lock for a few file operations. One this old died holding it: clear it once.
+      // Looking at the lock and deleting it are two steps, so two processes that clear the same dead lock at the
+      // same moment can both end up inside `change`. The owner marks keep that harmless: of two calls that change
+      // one claim, only the one whose mark the record carries acts on the outcome.
       try {
         if (this.now() - fs.statSync(lock).mtimeMs <= LOCK_STALE_MS) return null;
-        fs.renameSync(lock, aside);
-        if (this.now() - fs.statSync(aside).mtimeMs <= LOCK_STALE_MS) {
-          try {
-            fs.linkSync(aside, lock);
-          } catch {
-            // A third process holds the lock by now; the one moved aside stays aside.
-          }
-          fs.unlinkSync(aside);
-          return null;
-        }
-        fs.unlinkSync(aside);
+        fs.unlinkSync(lock);
       } catch {
         return null;
       }
@@ -409,20 +408,22 @@ export class ClaimStore {
 
   /**
    * What a call that presents an already claimed payment may do:
-   *   "used"   the payment was used, or is in use by a different call (also: a record this code cannot read, a
-   *            payment claimed long ago and never sent for settlement, a settlement too old to ask about);
-   *   "open"   an earlier presentation of this same call is at work on it right now;
-   *   "resume" the call's settlement was left unresolved (or its owner is gone): this call may ask about it again.
+   *   "used"    the payment was used, or is in use by a different call (also: a claim whose content is not a record
+   *             this code knows, a payment claimed long ago and never sent for settlement, a settlement too old to
+   *             ask about);
+   *   "open"    an earlier presentation of this same call is at work on it right now;
+   *   "resume"  the call's settlement was left unresolved (or its owner is gone): this call may ask about it again;
+   *   "unknown" the claim file is there and could not be read.
    * Reads only.
    */
-  heldFor(key: string, call: string): "used" | "open" | "resume" {
+  heldFor(key: string, call: string): "used" | "open" | "resume" | "unknown" {
     let rec: ClaimRecord | null;
     try {
       rec = this.read(key);
     } catch (err) {
-      // Not knowing what the claim says is no ground for offering a new payment: the caller is told to wait.
+      // Not knowing what the claim says is no ground for offering a new payment.
       this.log(`[x402] could not read a payment claim: ${String(err)}`);
-      return "open";
+      return "unknown";
     }
     if (!rec || rec.s === "settled" || rec.call !== call) return "used";
     const fresh = this.now() - rec.t < SETTLING_STALE_MS;
@@ -435,19 +436,20 @@ export class ClaimStore {
 
   /**
    * Makes the calling call the owner of a settlement that `heldFor` reports as "resume". Returns the owner mark, the
-   * request to send again and the transaction the facilitator named (if any); or "open" / "used" when another call
-   * got there first.
+   * request to send again, the transaction the facilitator named (if any) and the mark of a payment already known
+   * to be settled (if any); or "open" / "used" when another call got there first.
    */
-  takeOver(key: string, call: string): { owner: string; body: string; tx: string } | "open" | "used" {
-    let taken: { value: { owner: string; body: string; tx: string } | "open" | "used" } | null;
+  takeOver(key: string, call: string): { owner: string; body: string; tx: string; paid?: PaidMark } | "open" | "used" {
+    let taken: { value: { owner: string; body: string; tx: string; paid?: PaidMark } | "open" | "used" } | null;
     try {
       taken = this.locked(key, () => {
         const state = this.heldFor(key, call);
-        if (state !== "resume") return state;
+        if (state !== "resume") return state === "used" ? "used" : "open";
         const rec = this.read(key) as Extract<ClaimRecord, { s: "settling" | "unresolved" }>;
         const owner = randomUUID();
-        this.write(key, { s: "settling", t: this.now(), f: rec.f, o: owner, call, body: rec.body, ...(rec.tx ? { tx: rec.tx } : {}) });
-        return { owner, body: rec.body, tx: rec.tx ?? "" };
+        const kept = { ...(rec.tx ? { tx: rec.tx } : {}), ...(rec.paid ? { paid: rec.paid } : {}) };
+        this.write(key, { s: "settling", t: this.now(), f: rec.f, o: owner, call, body: rec.body, ...kept });
+        return { owner, body: rec.body, tx: rec.tx ?? "", ...(rec.paid ? { paid: rec.paid } : {}) };
       });
     } catch (err) {
       this.log(`[x402] could not take over an unresolved settlement: ${String(err)}`);
@@ -474,9 +476,11 @@ export class ClaimStore {
       if (end.s === "released") fs.unlinkSync(this.file(key));
       else if (end.s === "settled") this.write(key, { s: "settled", t: this.now(), tx: end.tx });
       else {
-        // A transaction the facilitator named earlier stays on record when its later replies name none.
+        // A transaction the facilitator named earlier stays on record when its later replies name none, and so
+        // does the mark of a payment known to be settled.
         const tx = end.tx || rec.tx;
-        this.write(key, { s: "unresolved", t: this.now(), f: rec.f, call: rec.call, body: rec.body, ...(tx ? { tx } : {}) });
+        const paid = end.paid ?? rec.paid;
+        this.write(key, { s: "unresolved", t: this.now(), f: rec.f, call: rec.call, body: rec.body, ...(tx ? { tx } : {}), ...(paid ? { paid } : {}) });
       }
       return "done";
     };
@@ -506,15 +510,19 @@ export class ClaimStore {
 
   /**
    * Delete claims older than 24 hours (their payments can no longer settle, and the facilitator keeps an outcome
-   * that long), and locks and half-written records a process left behind when it died.
+   * that long), and what a process left behind when it died: half-written records, and locks whose claim is gone
+   * (a lock whose claim is still there is cleared by the next call that needs it, see `locked`).
    */
   private pruneOccasionally(): void {
     const now = this.now();
     if (now - this.lastPrune < PRUNE_EVERY_MS) return;
     this.lastPrune = now;
     try {
-      for (const name of fs.readdirSync(this.dir)) {
-        const maxAge = name.endsWith(".claim") ? CLAIM_TTL_MS : name.endsWith(".lock") || name.endsWith(".tmp") ? LOCK_STALE_MS : null;
+      const names = fs.readdirSync(this.dir);
+      const claimed = new Set(names.filter((name) => name.endsWith(".claim")).map((name) => name.slice(0, -".claim".length)));
+      for (const name of names) {
+        const orphanLock = name.endsWith(".lock") && !claimed.has(name.slice(0, -".lock".length));
+        const maxAge = name.endsWith(".claim") ? CLAIM_TTL_MS : orphanLock || name.endsWith(".tmp") ? LOCK_STALE_MS : null;
         if (maxAge === null) continue;
         const file = path.join(this.dir, name);
         try {
@@ -999,9 +1007,12 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
          */
         const STUCK_RETRY_SECONDS = SETTLING_STALE_MS / 1000;
 
-        /** Settles the payment whose settlement this call owns, then runs the tool. */
-        const settleAndRun = async (owner: string, body: string, again: boolean, known = ""): Promise<ToolResult> => {
-          const outcome = await resolveSettlement(body, again, known);
+        /**
+         * Settles the payment whose settlement this call owns, then runs the tool. `paid`: an earlier call already
+         * had the facilitator's answer that the payment settled, so it is not asked again.
+         */
+        const settleAndRun = async (owner: string, body: string, again: boolean, known = "", paid?: PaidMark): Promise<ToolResult> => {
+          const outcome: SettleOutcome = paid ? { kind: "settled", transaction: paid.tx, network: paid.network } : await resolveSettlement(body, again, known);
           const tx = brief(outcome.transaction) || "-";
           if (outcome.kind === "failed") {
             const ended = await endClaim(key, owner, { s: "released" });
@@ -1022,8 +1033,10 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           if (recorded === "error") {
             // Run now and the claim would still read as a settlement in progress: the same call could resume it
             // later and run the tool a second time. So the tool waits for a call that can record the payment. The
-            // claim is handed on as unresolved if that much can be written, so the same call can resume it at once.
-            const kept = await endClaim(key, owner, { s: "unresolved", tx: signatureOf(outcome.transaction) });
+            // claim is handed on as unresolved, marked as paid, if that much can be written: the same call can then
+            // resume it at once, and needs no second answer from the facilitator.
+            const paidMark = { tx: outcome.transaction, network: outcome.network };
+            const kept = await endClaim(key, owner, { s: "unresolved", tx: signatureOf(outcome.transaction), paid: paidMark });
             log(`[x402] ${name}: settled (paid), but the claim could not be marked settled, tool not run: tx=${tx} payer=${payer}`);
             return unresolved(outcome.transaction, NOT_RECORDED_MESSAGE, kept === "done" ? UNRESOLVED_RETRY_SECONDS : STUCK_RETRY_SECONDS);
           }
@@ -1065,6 +1078,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           const held = claims.heldFor(key, call);
           if (held === "used") return paymentRequired("PAYMENT_ALREADY_USED");
           if (held === "open") return unresolved("", IN_PROGRESS_MESSAGE);
+          if (held === "unknown") return unresolved("", CLAIM_UNREADABLE_MESSAGE);
           if (options.preflight) {
             // The payment may already be taken, so nothing is promised here: the settlement stays as it is.
             let notReady: string | null;
@@ -1082,8 +1096,9 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           const taken = claims.takeOver(key, call);
           if (taken === "used") return paymentRequired("PAYMENT_ALREADY_USED");
           if (taken === "open") return unresolved("", IN_PROGRESS_MESSAGE);
-          log(`[x402] ${name}: asking again about an unresolved settlement: tx=${brief(taken.tx) || "-"} payer=${payer}`);
-          return settleAndRun(taken.owner, taken.body, true, taken.tx);
+          if (taken.paid) log(`[x402] ${name}: resuming a settled payment whose call has not run: tx=${brief(taken.paid.tx) || "-"} payer=${payer}`);
+          else log(`[x402] ${name}: asking again about an unresolved settlement: tx=${brief(taken.tx) || "-"} payer=${payer}`);
+          return settleAndRun(taken.owner, taken.body, true, taken.tx, taken.paid);
         }
 
         let verified: VerifyResponse;

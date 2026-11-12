@@ -661,6 +661,14 @@ test("locks and half-written records left by a dead process are cleared with the
   for (const file of stale) assert.equal(fs.existsSync(file), false, file);
   for (const file of recent) assert.equal(fs.existsSync(file), true, file);
   assert.equal(claimFiles(h.claimsDir).length, 2);
+  // An old lock whose claim is still there is left for the call that next needs it.
+  const beside = path.join(h.claimsDir, claimFiles(h.claimsDir)[0].replace(/\.claim$/, ".lock"));
+  fs.writeFileSync(beside, "");
+  h.clock.now += 10 * 60 * 1000;
+  const older = new Date(h.clock.now - 61 * 1000);
+  fs.utimesSync(beside, older, older);
+  assert.equal((await h.handler({}, paid(token("pay-u17c")))).isError, undefined);
+  assert.equal(fs.existsSync(beside), true);
 });
 
 test("on resuming, the readiness check comes first: a tool that is not ready leaves the settlement as it is", async () => {
@@ -969,7 +977,7 @@ test("a claim that cannot be read, or a claim directory that fails, never leads 
       const result = await h.handler({}, paid(tok));
       assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
       assert.equal(x402Error(result).accepts, undefined);
-      assert.match(String(x402Error(result).message), /still in progress/);
+      assert.match(String(x402Error(result).message), /cannot read this payment's record right now/);
     },
   );
   assert.ok(h.logs.some((l) => l.includes("could not read a payment claim") && l.includes("EMFILE")));
@@ -1058,11 +1066,51 @@ test("when only the settled record fails to write, the claim is handed on as unr
       assert.equal(x402Error(result).retryAfterSeconds, 30);
       assert.equal(h.events.includes("tool"), false);
       assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
-      assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+      assert.deepEqual(onlyClaim(h.claimsDir).paid, { tx: SIGNATURE, network: "solana" }, "the record says the payment is settled");
+      // Other arguments do not get the paid call.
+      assert.equal(errorCode(await h.handler({ x: "other" }, paid(tok))), "PAYMENT_ALREADY_USED");
+      const resumed = await h.handler({}, paid(tok));
+      assert.equal(resumed.isError, undefined);
+      assert.equal((resumed._meta?.["x402/payment-response"] as X402Settlement).transaction, SIGNATURE);
     },
   );
   assert.equal(h.events.filter((e) => e === "tool").length, 1);
+  assert.equal(h.events.filter((e) => e === "settle").length, 1, "the facilitator already answered: it is not asked again");
+  assert.ok(h.logs.some((l) => l.includes("resuming a settled payment whose call has not run")));
   assert.equal(onlyClaim(h.claimsDir).s, "settled");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+});
+
+test("an owner that cannot read its own claim when the answer comes does not run the tool, and releases nothing it cannot see", async () => {
+  let unreadable = false;
+  const h = harness({
+    settleBody: async () => {
+      unreadable = true;
+      return SETTLED;
+    },
+  });
+  const tok = token("pay-u23");
+  await withFs(
+    "readFileSync",
+    (original) => ((file: unknown, ...rest: unknown[]) => {
+      if (unreadable && String(file).endsWith(".claim")) throw fsError("EIO");
+      return (original as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync,
+    async () => {
+      const result = await h.handler({}, paid(tok));
+      assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
+      assert.match(String(x402Error(result).message), /could not be recorded as paid/);
+      assert.equal(x402Error(result).retryAfterSeconds, 600);
+      assert.equal(x402Error(result).accepts, undefined);
+    },
+  );
+  assert.equal(h.events.includes("tool"), false);
+  assert.equal(onlyClaim(h.claimsDir).s, "settling", "the claim is still held");
+  assert.deepEqual(leftovers(h.claimsDir), []);
+  unreadable = false;
+  h.clock.now += 10 * 60 * 1000;
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
 });
 
 test("resuming gets 20 seconds, and a readiness check that throws leaves the settlement as it is", async () => {
