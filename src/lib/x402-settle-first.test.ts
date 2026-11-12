@@ -21,16 +21,21 @@ import { getSetComputeUnitLimitInstruction, getSetComputeUnitPriceInstruction } 
 import { getCreateAssociatedTokenInstruction, getTransferCheckedInstruction, TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { TOKEN_2022_PROGRAM_ADDRESS } from "@solana-program/token-2022";
 import { decodePayment, encodePayment } from "x402/schemes";
-import type { SettleResponse, VerifyResponse } from "x402/types";
+import type { VerifyResponse } from "x402/types";
 import {
+  classifySettle,
   createSettleFirstPaidTools,
   MAX_PAYMENT_TOKEN_LENGTH,
+  paidCallId,
   paymentAuthority,
   paymentClaimKey,
   paymentTokenAuthority,
+  postSettle,
   PREFLIGHT_FAILED,
+  SETTLEMENT_UNRESOLVED,
   type FacilitatorClient,
   type SettleFirstConfig,
+  type SettleReply,
   type ToolResult,
   type X402Settlement,
 } from "./x402-settle-first.js";
@@ -130,20 +135,36 @@ interface Harness {
   logs: string[];
   extras: unknown[];
   claimsDir: string;
+  /** The server's clock. Waiting between settle requests moves it; nothing else does. */
+  clock: { now: number };
+  /** Every wait between two settle requests, in milliseconds. */
+  sleeps: number[];
 }
 
 function harness(opts: {
   verify?: () => Promise<VerifyResponse>;
-  settle?: () => Promise<SettleResponse>;
+  /** The facilitator's answer to a settle request (as HTTP 200); a rejection is a request that got no reply. */
+  settle?: () => Promise<SettleReply>;
   claimsDir?: string;
+  /** The paid tool's name (default "echo") and description: two servers share a claim directory, not their tools. */
+  toolName?: string;
+  description?: string;
   toolResult?: () => Promise<ToolResult>;
   precheck?: (args: { x?: string }) => string | null;
   preflight?: (args: { x?: string }) => Promise<string | null> | string | null;
   events?: string[];
+  /** A facilitator that is given a settle request's exact body and may answer with any HTTP status. */
+  settleBody?: (body: string, timeoutMs: number) => Promise<SettleReply>;
+  clock?: { now: number };
+  /** Waiting between settle requests does not move the clock. */
+  stoppedClock?: boolean;
 } = {}): Harness {
   const events: string[] = opts.events ?? [];
   const logs: string[] = [];
   const extras: unknown[] = [];
+  const sleeps: number[] = [];
+  const clock = opts.clock ?? { now: Date.now() };
+  const settleBody = opts.settleBody;
   const claimsDir = opts.claimsDir ?? tempDir();
   const facilitator: FacilitatorClient = {
     supported: async () => {
@@ -154,8 +175,9 @@ function harness(opts: {
       events.push("verify");
       return opts.verify ? opts.verify() : { isValid: true, payer: "Payer1111" };
     },
-    settle: async () => {
+    settleBody: async (body: string, timeoutMs: number) => {
       events.push("settle");
+      if (settleBody) return settleBody(body, timeoutMs);
       return opts.settle ? opts.settle() : { success: true, transaction: "sig-1", network: "solana", payer: "Payer1111" };
     },
   };
@@ -164,6 +186,11 @@ function harness(opts: {
     claimsDir,
     log: (line) => logs.push(line),
     info: (line) => logs.push(line),
+    now: () => clock.now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      if (!opts.stoppedClock) clock.now += ms;
+    },
   });
   const tools = new Map<string, Handler>();
   const server = {
@@ -171,9 +198,10 @@ function harness(opts: {
       tools.set(args[0] as string, args[4] as Handler);
     },
   };
+  const toolName = opts.toolName ?? "echo";
   settleFirst(server)(
-    "echo",
-    "Echo",
+    toolName,
+    opts.description ?? "Echo",
     "$0.01",
     {},
     {},
@@ -194,10 +222,29 @@ function harness(opts: {
         : {}),
     },
   );
-  const handler = tools.get("echo");
+  const handler = tools.get(toolName);
   assert.ok(handler, "tool registered");
-  return { handler, events, logs, extras, claimsDir };
+  return { handler, events, logs, extras, claimsDir, clock, sleeps };
 }
+
+/** Shaped like a Solana transaction signature, which is what an unresolved settlement may name to its caller. */
+const SIGNATURE = "4".repeat(44) + "A".repeat(44);
+const PENDING: SettleReply = { success: false, errorReason: "settlement_pending", transaction: SIGNATURE, network: "solana", payer: "", httpStatus: 200 };
+const SETTLED: SettleReply = { success: true, transaction: SIGNATURE, network: "solana", payer: "Payer1111", httpStatus: 200 };
+
+function claimFiles(dir: string): string[] {
+  return fs.readdirSync(dir).filter((n) => n.endsWith(".claim"));
+}
+function onlyClaim(dir: string): Record<string, unknown> {
+  const files = claimFiles(dir);
+  assert.equal(files.length, 1, "one claim file");
+  return JSON.parse(fs.readFileSync(path.join(dir, files[0]), "utf8")) as Record<string, unknown>;
+}
+/** Nothing a claim change leaves behind when it is done: no lock, no half-written record. */
+function leftovers(dir: string): string[] {
+  return fs.readdirSync(dir).filter((n) => !n.endsWith(".claim"));
+}
+const x402Error = (result: ToolResult) => (result._meta?.["x402/error"] ?? {}) as Record<string, unknown>;
 
 function errorCode(result: ToolResult): unknown {
   return (result._meta?.["x402/error"] as { error?: unknown } | undefined)?.error;
@@ -231,7 +278,28 @@ test("the payment settles before the tool runs, and the tool sees the settlement
   assert.equal((result._meta?.["x402/payment-response"] as X402Settlement).payer, walletOf("payer-wallet"));
 });
 
-test("a payment that does not settle never runs the tool, is logged, and can be retried", async () => {
+test("a payment the facilitator definitely refuses never runs the tool, is logged, and can be presented again", async () => {
+  let attempt = 0;
+  const h = harness({
+    settle: async () =>
+      ++attempt === 1
+        ? { success: false, errorReason: "insufficient_funds", transaction: "", network: "solana" }
+        : { success: true, transaction: "sig-2", network: "solana", payer: "Payer1111" },
+  });
+  const tok = token("pay-2");
+  const first = await h.handler({}, paid(tok));
+  assert.equal(errorCode(first), "insufficient_funds");
+  assert.ok(Array.isArray(x402Error(first).accepts), "a refused payment is offered a new one");
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle"]);
+  assert.ok(h.logs.some((l) => l.includes("settle failed") && l.includes("insufficient_funds")));
+  assert.deepEqual(claimFiles(h.claimsDir), []);
+  const second = await h.handler({}, paid(tok));
+  assert.equal(second.isError, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "verify", "settle", "tool"]);
+  assert.deepEqual(h.sleeps, [], "a definite answer is not asked for twice");
+});
+
+test("a settlement the facilitator has not finished is not a failure: the same call asks again and runs the tool once it settled", async () => {
   let attempt = 0;
   const h = harness({
     settle: async () =>
@@ -239,17 +307,16 @@ test("a payment that does not settle never runs the tool, is logged, and can be 
         ? { success: false, errorReason: "settle_exact_svm_transaction_confirmation_timed_out", transaction: "sig-maybe", network: "solana" }
         : { success: true, transaction: "sig-2", network: "solana", payer: "Payer1111" },
   });
-  const tok = token("pay-2");
-  const first = await h.handler({}, paid(tok));
-  assert.equal(errorCode(first), "settle_exact_svm_transaction_confirmation_timed_out");
-  assert.deepEqual(paymentEvents(h.events), ["verify", "settle"]);
-  assert.ok(h.logs.some((l) => l.includes("settle failed") && l.includes("confirmation_timed_out") && l.includes("sig-maybe")));
-  const second = await h.handler({}, paid(tok));
-  assert.equal(second.isError, undefined);
-  assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "verify", "settle", "tool"]);
+  const result = await h.handler({}, paid(token("pay-2b")));
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "settle", "tool"]);
+  assert.equal((result._meta?.["x402/payment-response"] as X402Settlement).transaction, "sig-2");
+  assert.deepEqual(h.sleeps, [2000]);
+  assert.equal(onlyClaim(h.claimsDir).s, "settled");
+  assert.deepEqual(leftovers(h.claimsDir), []);
 });
 
-test("a settle request that throws does not run the tool and releases the claim", async () => {
+test("a settle request that gets no reply is not a failure either: the same call asks again", async () => {
   let attempt = 0;
   const h = harness({
     settle: async () => {
@@ -258,11 +325,467 @@ test("a settle request that throws does not run the tool and releases the claim"
     },
   });
   const tok = token("pay-3");
-  assert.equal(errorCode(await h.handler({}, paid(tok))), "SETTLEMENT_FAILED");
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["verify", "settle", "settle", "tool"]);
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+});
+
+test("a settlement still unresolved when the call's time is up: claim kept, outcome reported as unknown, no new payment offered", async () => {
+  const bodies: string[] = [];
+  const timeouts: number[] = [];
+  const h = harness({
+    settleBody: async (body, timeoutMs) => {
+      bodies.push(body);
+      timeouts.push(timeoutMs);
+      return PENDING;
+    },
+  });
+  const tok = token("pay-u1");
+  const result = await h.handler({ x: "a" }, paid(tok));
+  assert.equal(result.isError, true);
+  assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
+  const error = x402Error(result);
+  assert.equal(error.accepts, undefined, "no accepts: a client that pays whatever is offered must not pay twice");
+  assert.equal(error.transaction, SIGNATURE);
+  assert.equal(error.retryAfterSeconds, 30);
+  assert.match(String(error.message), /Do not send a new payment/);
+  assert.equal(result._meta?.["x402/payment-response"], undefined);
   assert.equal(h.events.includes("tool"), false);
-  assert.ok(h.logs.some((l) => l.includes("settle request failed")));
+  // Asked 7 times in 45 seconds, every time with the identical body, each request given what is left of the time.
+  assert.deepEqual(h.sleeps, [2000, 3000, 5000, 10000, 10000, 10000]);
+  assert.equal(bodies.length, 7);
+  assert.equal(new Set(bodies).size, 1);
+  assert.deepEqual(timeouts, [45000, 43000, 40000, 35000, 25000, 15000, 5000]);
+  const sent = JSON.parse(bodies[0]) as { x402Version: number; paymentPayload: { payload: { transaction: string } }; paymentRequirements: { payTo: string } };
+  assert.equal(sent.x402Version, 1);
+  assert.equal(sent.paymentPayload.payload.transaction, txBase64("pay-u1"));
+  assert.equal(sent.paymentRequirements.payTo, CONFIG.recipient.svm.address);
+  assert.ok(h.logs.some((l) => l.includes("settlement unresolved, claim kept, tool not run") && l.includes("settlement_pending") && l.includes(SIGNATURE)));
+  const claim = onlyClaim(h.claimsDir);
+  assert.equal(claim.s, "unresolved");
+  assert.equal(claim.tx, SIGNATURE);
+  assert.equal(claim.body, bodies[0]);
+  assert.equal(claim.call, paidCallId("echo", { x: "a" }));
+  assert.deepEqual(leftovers(h.claimsDir), []);
+});
+
+test("presenting an unresolved payment with the same call again asks once more, without a new verify, and runs the tool when it settled", async () => {
+  let reply = PENDING;
+  const bodies: string[] = [];
+  const h = harness({
+    settleBody: async (body) => {
+      bodies.push(body);
+      return reply;
+    },
+  });
+  const tok = token("pay-u2");
+  assert.equal(errorCode(await h.handler({ x: "a" }, paid(tok))), SETTLEMENT_UNRESOLVED);
+  const asked = bodies.length;
+  h.events.length = 0;
+  reply = SETTLED;
+  const again = await h.handler({ x: "a" }, paid(tok));
+  assert.equal(again.isError, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["settle", "tool"]);
+  assert.equal(bodies.length, asked + 1);
+  assert.equal(new Set(bodies).size, 1, "the later request carries the first request's body");
+  const response = again._meta?.["x402/payment-response"] as X402Settlement & { success: boolean };
+  assert.equal(response.success, true);
+  assert.equal(response.transaction, SIGNATURE);
+  assert.equal(response.payer, walletOf("payer-wallet"));
+  assert.ok(h.logs.some((l) => l.includes("asking again about an unresolved settlement")));
+  assert.equal(onlyClaim(h.claimsDir).s, "settled");
+  assert.equal(errorCode(await h.handler({ x: "a" }, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+});
+
+test("an unresolved payment is resumed only by the call that started it: other arguments are refused and the facilitator is not asked", async () => {
+  let reply = PENDING;
+  const h = harness({ settleBody: async () => reply });
+  const tok = token("pay-u3");
+  assert.equal(errorCode(await h.handler({ x: "a" }, paid(tok))), SETTLEMENT_UNRESOLVED);
+  const asked = h.events.filter((e) => e === "settle").length;
+  reply = SETTLED;
+  assert.equal(errorCode(await h.handler({ x: "b" }, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(h.events.filter((e) => e === "settle").length, asked);
+  assert.equal(h.events.includes("tool"), false);
+  assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+  // The same arguments in another key order are the same call.
+  assert.equal(paidCallId("echo", { a: 1, b: [{ d: 1, c: 2 }] }), paidCallId("echo", { b: [{ c: 2, d: 1 }], a: 1 }));
+  assert.notEqual(paidCallId("echo", { a: 1 }), paidCallId("other", { a: 1 }));
+  assert.notEqual(paidCallId("echo", { a: 1 }), paidCallId("echo", { a: "1" }));
+});
+
+test("when the facilitator's recorded outcome is a failure, the claim is released and a new payment is offered", async () => {
+  let reply = PENDING;
+  const h = harness({ settleBody: async () => reply });
+  const tok = token("pay-u4");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  reply = { success: false, errorReason: "invalid_transaction_state", transaction: SIGNATURE, network: "solana", payer: "", httpStatus: 200 };
+  const failed = await h.handler({}, paid(tok));
+  assert.equal(errorCode(failed), "invalid_transaction_state");
+  assert.ok(Array.isArray(x402Error(failed).accepts));
+  assert.equal(h.events.includes("tool"), false);
+  assert.deepEqual(claimFiles(h.claimsDir), []);
+  assert.deepEqual(leftovers(h.claimsDir), []);
+});
+
+test("a refusal that is not HTTP 200 ends a payment's first settle request, but says nothing about an earlier one", async () => {
+  const refusal: SettleReply = { success: false, errorReason: "free_tier_exhausted", transaction: "", network: "solana", payer: "", httpStatus: 403 };
+  const first = harness({ settleBody: async () => refusal });
+  const refused = await first.handler({}, paid(token("pay-u5")));
+  assert.equal(errorCode(refused), "free_tier_exhausted");
+  assert.deepEqual(claimFiles(first.claimsDir), []);
+  assert.equal(first.events.filter((e) => e === "settle").length, 1);
+
+  let reply = PENDING;
+  const later = harness({ settleBody: async () => reply });
+  const tok = token("pay-u5b");
+  assert.equal(errorCode(await later.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  reply = refusal;
+  assert.equal(errorCode(await later.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  assert.equal(onlyClaim(later.claimsDir).s, "unresolved");
+  assert.equal(onlyClaim(later.claimsDir).tx, SIGNATURE, "the transaction named earlier is kept");
+  assert.equal(later.events.includes("tool"), false);
+});
+
+test("classifySettle: only a definite answer is a failure", () => {
+  const kind = (reply: SettleReply, first = true) => classifySettle(reply, first).kind;
+  assert.equal(kind({ success: true, transaction: "t", network: "solana", httpStatus: 200 }), "settled");
+  assert.equal(kind({ success: true, transaction: "t", network: "solana" }), "settled", "a reply without a status is HTTP 200");
+  assert.equal(kind({ success: true, transaction: "t", network: "solana", httpStatus: 500 }), "unresolved");
+  assert.equal(kind({ success: false, errorReason: "insufficient_funds", httpStatus: 200 }), "failed");
+  assert.equal(kind({ success: false, errorReason: "insufficient_funds", httpStatus: 200 }, false), "failed");
+  assert.equal(kind({ success: false, httpStatus: 200 }), "failed");
+  assert.equal(classifySettle({ success: false, httpStatus: 200 }, true).kind === "failed" && (classifySettle({ success: false, httpStatus: 200 }, true) as { reason: string }).reason, "SETTLEMENT_FAILED");
+  for (const errorReason of ["settlement_pending", "duplicate_settlement", "internal_server_error", "service_unavailable", "unexpected_settle_error", "settle_exact_svm_transaction_confirmation_timed_out", "idempotency_key_in_flight"] as const) {
+    assert.equal(kind({ success: false, errorReason, httpStatus: 200 } as SettleReply), "unresolved", errorReason);
+    assert.equal(kind({ success: false, errorReason, httpStatus: 400 } as SettleReply), "unresolved", `${errorReason} with HTTP 400`);
+  }
+  for (const httpStatus of [408, 409, 425, 429, 500, 502, 503, 504]) {
+    assert.equal(kind({ success: false, errorReason: "insufficient_funds", httpStatus }), "unresolved", `HTTP ${httpStatus}`);
+    assert.equal(kind({ httpStatus }), "unresolved", `HTTP ${httpStatus} without a readable body`);
+  }
+  for (const httpStatus of [400, 401, 403, 404, 422]) {
+    assert.equal(kind({ success: false, errorReason: "invalid_payload", httpStatus }), "failed", `first request, HTTP ${httpStatus}`);
+    assert.equal(kind({ httpStatus }), "failed", `first request, HTTP ${httpStatus} without a readable body`);
+    assert.equal(kind({ success: false, errorReason: "invalid_payload", httpStatus }, false), "unresolved", `later request, HTTP ${httpStatus}`);
+  }
+  assert.equal(kind({ httpStatus: 200 }), "unresolved", "HTTP 200 without a readable body");
+  assert.equal(kind({}), "unresolved");
+  assert.equal(kind({ httpStatus: 302 }), "unresolved");
+  const pending = classifySettle(PENDING, true);
+  assert.deepEqual(pending, { kind: "unresolved", reason: "settlement_pending", transaction: SIGNATURE });
+});
+
+test("an unresolved payment presented five times in parallel runs the tool once", async () => {
+  let reply: () => Promise<SettleReply> = async () => PENDING;
+  const h = harness({ settleBody: async () => reply() });
+  const tok = token("pay-u6");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  reply = async () => {
+    await gate;
+    return SETTLED;
+  };
+  const asked = h.events.filter((e) => e === "settle").length;
+  const pending = Array.from({ length: 5 }, () => h.handler({}, paid(tok)));
+  await new Promise((resolve) => setImmediate(resolve));
+  release();
+  const results = await Promise.all(pending);
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+  assert.equal(h.events.filter((e) => e === "settle").length, asked + 1);
+  assert.equal(results.filter((r) => r.isError === undefined).length, 1);
+  const waiting = results.filter((r) => errorCode(r) === SETTLEMENT_UNRESOLVED);
+  assert.equal(waiting.length, 4);
+  assert.match(String(x402Error(waiting[0]).message), /earlier call with this payment is still in progress/);
+  assert.equal(x402Error(waiting[0]).accepts, undefined);
+});
+
+test("a settlement whose call is gone is resumed after ten minutes, and the call that comes back late does not run the tool again", async () => {
+  const claimsDir = tempDir();
+  const clock = { now: Date.now() };
+  const events: string[] = [];
+  let answerFirst: (reply: SettleReply) => void = () => {};
+  const hung = new Promise<SettleReply>((resolve) => {
+    answerFirst = resolve;
+  });
+  const first = harness({ claimsDir, clock, events, settle: () => hung });
+  const tok = token("pay-u7");
+  const firstCall = first.handler({ x: "a" }, paid(tok));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(onlyClaim(claimsDir).s, "settling");
+
+  // While the first call may still be at work, the payment is neither used up nor resumable.
+  const second = harness({ claimsDir, clock, events });
+  const early = await second.handler({ x: "a" }, paid(tok));
+  assert.equal(errorCode(early), SETTLEMENT_UNRESOLVED);
+  assert.equal(x402Error(early).accepts, undefined);
+  clock.now += 10 * 60 * 1000 - 1;
+  assert.equal(errorCode(await second.handler({ x: "a" }, paid(tok))), SETTLEMENT_UNRESOLVED);
+  assert.equal(events.filter((e) => e === "tool").length, 0);
+  assert.equal(events.filter((e) => e === "settle").length, 1);
+
+  clock.now += 1;
+  const late = await second.handler({ x: "a" }, paid(tok));
+  assert.equal(late.isError, undefined);
+  assert.equal(events.filter((e) => e === "tool").length, 1);
+  assert.equal(onlyClaim(claimsDir).s, "settled");
+
+  answerFirst({ success: true, transaction: "sig-late", network: "solana", payer: "Payer1111" });
+  const stale = await firstCall;
+  assert.equal(errorCode(stale), SETTLEMENT_UNRESOLVED);
+  assert.equal(stale._meta?.["x402/payment-response"], undefined);
+  assert.equal(events.filter((e) => e === "tool").length, 1, "one payment, one tool run");
+  assert.ok(first.logs.some((l) => l.includes("this call no longer owns the settlement")));
+  assert.equal(onlyClaim(claimsDir).tx, "sig-1", "the record is the later call's");
+});
+
+test("a call that comes back late with a refusal, after a later call took its settlement over, releases nothing and offers nothing", async () => {
+  const claimsDir = tempDir();
+  const clock = { now: Date.now() };
+  let answerFirst: (reply: SettleReply) => void = () => {};
+  const hung = new Promise<SettleReply>((resolve) => {
+    answerFirst = resolve;
+  });
+  const first = harness({ claimsDir, clock, settle: () => hung });
+  const tok = token("pay-u7b");
+  const firstCall = first.handler({}, paid(tok));
+  await new Promise((resolve) => setImmediate(resolve));
+  clock.now += 10 * 60 * 1000;
+  const second = harness({ claimsDir, clock, settleBody: async () => PENDING });
+  assert.equal(errorCode(await second.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  assert.equal(onlyClaim(claimsDir).s, "unresolved");
+  answerFirst({ success: false, errorReason: "insufficient_funds", transaction: "", network: "solana" });
+  const stale = await firstCall;
+  assert.equal(errorCode(stale), SETTLEMENT_UNRESOLVED);
+  assert.equal(x402Error(stale).accepts, undefined);
+  assert.equal(onlyClaim(claimsDir).s, "unresolved", "the claim is the later call's to end");
+});
+
+test("a claim's lock that stays taken does not stop the owner recording the outcome: the tool runs once, and not again later", async () => {
+  let lock = "";
+  const h = harness({
+    settleBody: async () => {
+      // Another process takes this claim's lock while the settle request is out, and never lets go.
+      fs.writeFileSync(lock, "someone else");
+      const fresh = new Date(h.clock.now);
+      fs.utimesSync(lock, fresh, fresh);
+      return SETTLED;
+    },
+  });
+  const tok = token("pay-u13");
+  lock = path.join(h.claimsDir, `${paymentClaimKey(decodePayment(tok))}.lock`);
   assert.equal((await h.handler({}, paid(tok))).isError, undefined);
   assert.equal(h.events.filter((e) => e === "tool").length, 1);
+  assert.equal(h.sleeps.length, 20, "it waited for the lock first");
+  assert.ok(h.logs.some((l) => l.includes("lock stayed taken")));
+  assert.equal(onlyClaim(h.claimsDir).s, "settled");
+  assert.equal(fs.readFileSync(lock, "utf8"), "someone else", "a lock that is not its own is left alone");
+  fs.rmSync(lock);
+  h.clock.now += 11 * 60 * 1000;
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+});
+
+test("a settlement is resumed only inside 23 hours of its first request: the facilitator forgets after 24", async () => {
+  let reply = PENDING;
+  const h = harness({ settleBody: async () => reply });
+  const tok = token("pay-u14");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  const first = Number(onlyClaim(h.claimsDir).f);
+  // Asking again later rewrites the record, and keeps the time of the first request.
+  h.clock.now += 22 * 60 * 60 * 1000;
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  assert.equal(onlyClaim(h.claimsDir).f, first);
+  assert.ok(Number(onlyClaim(h.claimsDir).t) > first);
+  // Past 23 hours the facilitator is not asked: a failure it reported now would not be this payment's outcome.
+  h.clock.now = first + 23 * 60 * 60 * 1000;
+  reply = { success: false, errorReason: "invalid_transaction_state", transaction: "", network: "solana", payer: "", httpStatus: 200 };
+  const asked = h.events.filter((e) => e === "settle").length;
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(h.events.filter((e) => e === "settle").length, asked);
+  assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+});
+
+test("a settle request too long to record is not sent: the payment is refused unpaid", async () => {
+  const h = harness({ description: "d".repeat(16 * 1024) });
+  const tok = token("pay-u15");
+  const result = await h.handler({}, paid(tok));
+  assert.equal(errorCode(result), "PAYMENT_CLAIM_UNAVAILABLE");
+  assert.equal(x402Error(result).accepts, undefined);
+  assert.deepEqual(paymentEvents(h.events), ["verify"]);
+  assert.deepEqual(claimFiles(h.claimsDir), []);
+  assert.ok(h.logs.some((l) => l.includes("settle request too long to record")));
+});
+
+test("a refusal after a request that provably never reached the facilitator is still a first answer; after any other failure it is not", async () => {
+  const refusal: SettleReply = { success: false, errorReason: "free_tier_exhausted", transaction: "", network: "solana", payer: "", httpStatus: 403 };
+  const failingWith = (cause: unknown) => {
+    let attempt = 0;
+    return async (): Promise<SettleReply> => {
+      if (++attempt === 1) throw new TypeError("fetch failed", { cause });
+      return refusal;
+    };
+  };
+  for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"]) {
+    const h = harness({ settleBody: failingWith(Object.assign(new Error("connect failed"), { code })) });
+    const refused = await h.handler({}, paid(token(`pay-u16-${code}`)));
+    assert.equal(errorCode(refused), "free_tier_exhausted", code);
+    assert.ok(Array.isArray(x402Error(refused).accepts), code);
+    assert.deepEqual(claimFiles(h.claimsDir), [], code);
+  }
+  for (const cause of [Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }), Object.assign(new Error("aborted"), { code: "UND_ERR_SOCKET" }), undefined]) {
+    const h = harness({ settleBody: failingWith(cause) });
+    assert.equal(errorCode(await h.handler({}, paid(token(`pay-u16-${String((cause as { code?: string } | undefined)?.code)}`)))), SETTLEMENT_UNRESOLVED);
+    assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+  }
+});
+
+test("locks and half-written records left by a dead process are cleared with the old claims", async () => {
+  const h = harness();
+  assert.equal((await h.handler({}, paid(token("pay-u17a")))).isError, undefined);
+  const stale = ["abc.lock", "abc.claim.1234.tmp"].map((name) => path.join(h.claimsDir, name));
+  const recent = ["def.lock", "def.claim.5678.tmp"].map((name) => path.join(h.claimsDir, name));
+  h.clock.now += 10 * 60 * 1000;
+  for (const file of [...stale, ...recent]) fs.writeFileSync(file, "");
+  const old = new Date(h.clock.now - 61 * 1000);
+  for (const file of stale) fs.utimesSync(file, old, old);
+  const now = new Date(h.clock.now);
+  for (const file of recent) fs.utimesSync(file, now, now);
+  assert.equal((await h.handler({}, paid(token("pay-u17b")))).isError, undefined);
+  for (const file of stale) assert.equal(fs.existsSync(file), false, file);
+  for (const file of recent) assert.equal(fs.existsSync(file), true, file);
+  assert.equal(claimFiles(h.claimsDir).length, 2);
+  // An old lock whose claim is still there is left for the call that next needs it.
+  const beside = path.join(h.claimsDir, claimFiles(h.claimsDir)[0].replace(/\.claim$/, ".lock"));
+  fs.writeFileSync(beside, "");
+  h.clock.now += 10 * 60 * 1000;
+  const older = new Date(h.clock.now - 61 * 1000);
+  fs.utimesSync(beside, older, older);
+  assert.equal((await h.handler({}, paid(token("pay-u17c")))).isError, undefined);
+  assert.equal(fs.existsSync(beside), true);
+});
+
+test("on resuming, the readiness check comes first: a tool that is not ready leaves the settlement as it is", async () => {
+  let reply = PENDING;
+  let ready: string | null = null;
+  const h = harness({ settleBody: async () => reply, preflight: () => ready });
+  const tok = token("pay-u8");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  const asked = h.events.filter((e) => e === "settle").length;
+  reply = SETTLED;
+  ready = "The browser is not available right now. No payment was taken. Try again later.";
+  const notReady = await h.handler({}, paid(tok));
+  assert.equal(errorCode(notReady), SETTLEMENT_UNRESOLVED);
+  assert.match(String(x402Error(notReady).message), /not ready to run this call yet/);
+  assert.doesNotMatch(JSON.stringify(notReady), /No payment was taken/, "the payment may have been taken: the tool's own refusal text is not passed on");
+  assert.equal(h.events.filter((e) => e === "settle").length, asked, "the facilitator is not asked");
+  assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+  ready = null;
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+  // A payment that is used up, or someone else's call, never sets the check off.
+  const checks = h.events.filter((e) => e === "preflight").length;
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(errorCode(await h.handler({ x: "other" }, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(h.events.filter((e) => e === "preflight").length, checks);
+});
+
+test("a lock left by a process that died is cleared; a fresh one makes the caller wait", async () => {
+  let reply = PENDING;
+  const h = harness({ settleBody: async () => reply });
+  const tok = token("pay-u9");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  reply = SETTLED;
+  const asked = h.events.filter((e) => e === "settle").length;
+  const lock = path.join(h.claimsDir, `${paymentClaimKey(decodePayment(tok))}.lock`);
+  fs.writeFileSync(lock, "");
+  const fresh = new Date(h.clock.now);
+  fs.utimesSync(lock, fresh, fresh);
+  const held = await h.handler({}, paid(tok));
+  assert.equal(errorCode(held), SETTLEMENT_UNRESOLVED);
+  assert.match(String(x402Error(held).message), /earlier call with this payment is still in progress/);
+  assert.equal(h.events.filter((e) => e === "settle").length, asked);
+  const old = new Date(h.clock.now - 60 * 1000 - 1000);
+  fs.utimesSync(lock, old, old);
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+  assert.deepEqual(leftovers(h.claimsDir), []);
+});
+
+test("a claim record this code cannot read, or one that names an oversized request, is a used payment", async () => {
+  const h = harness();
+  const tok = token("pay-u10");
+  const file = path.join(h.claimsDir, `${paymentClaimKey(decodePayment(tok))}.claim`);
+  const call = paidCallId("echo", {});
+  for (const record of [
+    "not json",
+    "{}",
+    JSON.stringify({ s: "unresolved", t: 1 }),
+    JSON.stringify({ s: "unresolved", t: 1, call, body: "x".repeat(16 * 1024 + 1) }),
+    JSON.stringify({ s: "settling", t: 1, call, body: "{}" }),
+    JSON.stringify({ s: "elsewhere", t: 1, call, body: "{}" }),
+    JSON.stringify({ s: "pending", t: 1 }),
+    JSON.stringify({ s: "settled", t: 1, tx: "sig" }),
+  ]) {
+    fs.writeFileSync(file, record);
+    assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED", record.slice(0, 40));
+  }
+  assert.deepEqual(paymentEvents(h.events), []);
+});
+
+test("an unresolved settlement names a transaction to its caller only when it looks like one", async () => {
+  const h = harness({
+    settleBody: async () => ({ success: false, errorReason: "settlement_pending", transaction: "<b>see http://example.test</b>", httpStatus: 200 }) as SettleReply,
+  });
+  const result = await h.handler({}, paid(token("pay-u11")));
+  assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
+  assert.equal(x402Error(result).transaction, undefined);
+  assert.equal(onlyClaim(h.claimsDir).tx, undefined);
+});
+
+test("the number of settle requests one call makes is bounded even when the clock does not move", async () => {
+  const h = harness({ settleBody: async () => PENDING, stoppedClock: true });
+  assert.equal(errorCode(await h.handler({}, paid(token("pay-u12")))), SETTLEMENT_UNRESOLVED);
+  assert.equal(h.events.filter((e) => e === "settle").length, 12);
+});
+
+test("postSettle sends the body as given and returns the reply with its status, whatever the status", async () => {
+  const seen: Array<{ url: string; init: RequestInit }> = [];
+  const answering = (status: number, text: string): typeof fetch =>
+    (async (url: unknown, init?: RequestInit) => {
+      seen.push({ url: String(url), init: init ?? {} });
+      return new Response(text, { status, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+  const body = '{"x402Version":1,"paymentPayload":{"b":1,"a":2},"paymentRequirements":{}}';
+  assert.deepEqual(await postSettle("https://facilitator.example", body, 5000, answering(200, '{"success":true,"transaction":"t","network":"solana"}')), {
+    success: true,
+    transaction: "t",
+    network: "solana",
+    httpStatus: 200,
+  });
+  assert.equal(seen[0].url, "https://facilitator.example/settle");
+  assert.equal(seen[0].init.method, "POST");
+  assert.equal(seen[0].init.body, body);
+  assert.ok(seen[0].init.signal instanceof AbortSignal, "the request has a time limit");
+  assert.deepEqual(await postSettle("https://facilitator.example", body, 5000, answering(409, '{"success":false,"errorReason":"duplicate_settlement","transaction":""}')), {
+    success: false,
+    errorReason: "duplicate_settlement",
+    transaction: "",
+    httpStatus: 409,
+  });
+  assert.deepEqual(await postSettle("https://facilitator.example", body, 5000, answering(502, "<html>Bad Gateway</html>")), { httpStatus: 502 });
+  assert.deepEqual(await postSettle("https://facilitator.example", body, 5000, answering(200, '{"success":true,"httpStatus":500}')), { success: true, httpStatus: 200 });
+  assert.deepEqual(await postSettle("https://facilitator.example", body, 5000, answering(200, "[1]")), { httpStatus: 200 });
+  const refusing = (async () => {
+    throw new TypeError("fetch failed");
+  }) as typeof fetch;
+  await assert.rejects(postSettle("https://facilitator.example", body, 5000, refusing), /fetch failed/);
 });
 
 test("an invalid payment is refused before settle, and the fee-payer cache is refreshed", async () => {
@@ -295,7 +818,48 @@ test("one payment sent five times in parallel runs the tool once", async () => {
   const results = await Promise.all(pending);
   assert.equal(h.events.filter((e) => e === "tool").length, 1);
   assert.equal(h.events.filter((e) => e === "settle").length, 1);
-  assert.equal(results.filter((r) => errorCode(r) === "PAYMENT_ALREADY_USED").length, 4);
+  assert.equal(h.events.filter((e) => e === "verify").length, 1);
+  // The four copies are the same call with the same payment, which may yet be taken: they are told to wait, and
+  // are not offered a second payment.
+  const waiting = results.filter((r) => errorCode(r) === SETTLEMENT_UNRESOLVED);
+  assert.equal(waiting.length, 4);
+  for (const copy of waiting) {
+    assert.equal(x402Error(copy).accepts, undefined);
+    assert.match(String(x402Error(copy).message), /earlier call with this payment is still in progress/);
+  }
+  // Once the first call is done the payment is used up, for the same call too.
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+});
+
+test("the same payment with a different call while the first is in flight is refused as used, as is a claim that never got as far as a settle request", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const h = harness({
+    verify: async () => {
+      await gate;
+      return { isValid: true, payer: "Payer1111" };
+    },
+  });
+  const tok = token("pay-5b");
+  const first = h.handler({ x: "a" }, paid(tok));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(onlyClaim(h.claimsDir).s, "pending");
+  assert.equal(onlyClaim(h.claimsDir).call, paidCallId("echo", { x: "a" }));
+  assert.equal(errorCode(await h.handler({ x: "b" }, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(errorCode(await h.handler({ x: "a" }, paid(tok))), SETTLEMENT_UNRESOLVED);
+  // Ten minutes on and still "pending": its process died before anything was sent. Nothing can be taken, so the
+  // payer is not told to wait.
+  h.clock.now += 10 * 60 * 1000;
+  assert.equal(errorCode(await h.handler({ x: "a" }, paid(tok))), "PAYMENT_ALREADY_USED");
+  h.clock.now -= 10 * 60 * 1000;
+  release();
+  assert.equal((await first).isError, undefined);
+  // A "pending" record of the previous version of this file names no call: used, as it always was.
+  const older = token("pay-5c");
+  fs.writeFileSync(path.join(h.claimsDir, `${paymentClaimKey(decodePayment(older))}.claim`), JSON.stringify({ s: "pending", t: h.clock.now }));
+  assert.equal(errorCode(await h.handler({ x: "a" }, paid(older))), "PAYMENT_ALREADY_USED");
 });
 
 test("one payment sent to two servers sharing the claim directory runs one tool", async () => {
@@ -305,12 +869,12 @@ test("one payment sent to two servers sharing the claim directory runs one tool"
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const settle = async (): Promise<SettleResponse> => {
+  const settle = async (): Promise<SettleReply> => {
     await gate;
     return { success: true, transaction: "sig-6", network: "solana", payer: "Payer1111" };
   };
   const serverA = harness({ claimsDir, events, settle });
-  const serverB = harness({ claimsDir, events, settle });
+  const serverB = harness({ claimsDir, events, settle, toolName: "echo-b" });
   const tok = token("pay-6");
   const pending = [serverA.handler({}, paid(tok)), serverB.handler({}, paid(tok))];
   await new Promise((resolve) => setImmediate(resolve));
@@ -377,8 +941,237 @@ test("an unwritable claim store refuses the payment before any facilitator call"
   fs.writeFileSync(h.claimsDir, "not a directory");
   const result = await h.handler({}, paid(token("pay-11")));
   assert.equal(errorCode(result), "PAYMENT_CLAIM_UNAVAILABLE");
+  assert.equal(x402Error(result).accepts, undefined, "a service that cannot record payments does not ask for one");
   assert.deepEqual(paymentEvents(h.events), []);
   assert.ok(h.logs.some((l) => l.includes("claim store unavailable")));
+});
+
+/** Runs `body` with one function of node:fs replaced (the module under test uses the same object), then puts it back. */
+async function withFs<K extends "readFileSync" | "openSync" | "renameSync">(name: K, replacement: (original: (typeof fs)[K]) => (typeof fs)[K], body: () => Promise<void>): Promise<void> {
+  const original = fs[name];
+  fs[name] = replacement(original);
+  try {
+    await body();
+  } finally {
+    fs[name] = original;
+  }
+}
+const fsError = (code: string) => Object.assign(new Error(`${code}: simulated`), { code });
+
+test("a claim that cannot be read, or a claim directory that fails, never leads to an offer of a new payment", async () => {
+  let reply = PENDING;
+  const h = harness({ settleBody: async () => reply });
+  const tok = token("pay-u18");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  reply = SETTLED;
+  const asked = h.events.filter((e) => e === "settle").length;
+
+  // The claim file is there, and reading it fails (out of file handles): the claim may say "unresolved".
+  await withFs(
+    "readFileSync",
+    (original) => ((file: unknown, ...rest: unknown[]) => {
+      if (String(file).endsWith(".claim")) throw fsError("EMFILE");
+      return (original as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync,
+    async () => {
+      const result = await h.handler({}, paid(tok));
+      assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
+      assert.equal(x402Error(result).accepts, undefined);
+      assert.match(String(x402Error(result).message), /cannot read this payment's record right now/);
+    },
+  );
+  assert.ok(h.logs.some((l) => l.includes("could not read a payment claim") && l.includes("EMFILE")));
+
+  // Taking the claim fails with something other than "it exists".
+  await withFs(
+    "openSync",
+    (original) => ((file: unknown, ...rest: unknown[]) => {
+      if (String(file).endsWith(".claim")) throw fsError("EMFILE");
+      return (original as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.openSync,
+    async () => {
+      const result = await h.handler({}, paid(tok));
+      assert.equal(errorCode(result), "PAYMENT_CLAIM_UNAVAILABLE");
+      assert.equal(x402Error(result).accepts, undefined);
+    },
+  );
+  assert.equal(h.events.filter((e) => e === "settle").length, asked, "the facilitator was not asked meanwhile");
+  assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+  // With the directory working again the same call resumes it.
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+});
+
+test("a payment that settled but could not be recorded as settled does not run the tool until a call can record it", async () => {
+  // Every write to the claim fails once the settle request is out.
+  let failing = false;
+  const h = harness({
+    settleBody: async () => {
+      failing = true;
+      return SETTLED;
+    },
+  });
+  const tok = token("pay-u19");
+  await withFs(
+    "renameSync",
+    (original) => ((from: fs.PathLike, to: fs.PathLike) => {
+      if (failing && String(to).endsWith(".claim")) throw fsError("ENOSPC");
+      return original(from, to);
+    }) as typeof fs.renameSync,
+    async () => {
+      const result = await h.handler({}, paid(tok));
+      assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
+      assert.match(String(x402Error(result).message), /settled, but the call could not be recorded as paid/);
+      assert.equal(x402Error(result).accepts, undefined);
+      assert.equal(x402Error(result).retryAfterSeconds, 600, "the claim stays this call's for ten minutes");
+      assert.equal(x402Error(result).transaction, SIGNATURE);
+    },
+  );
+  assert.equal(h.events.includes("tool"), false);
+  assert.ok(h.logs.some((l) => l.includes("settled (paid), but the claim could not be marked settled, tool not run")));
+  assert.equal(onlyClaim(h.claimsDir).s, "settling");
+  assert.deepEqual(leftovers(h.claimsDir), []);
+  failing = false;
+  assert.match(String(x402Error(await h.handler({}, paid(tok))).message), /still in progress/);
+  h.clock.now += 10 * 60 * 1000;
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+  assert.equal(onlyClaim(h.claimsDir).s, "settled");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+});
+
+test("when only the settled record fails to write, the claim is handed on as unresolved and the same call can resume at once", async () => {
+  let failures = 0;
+  const h = harness({
+    settleBody: async () => {
+      if (failures === 0) failures = 1;
+      return SETTLED;
+    },
+  });
+  const tok = token("pay-u20");
+  await withFs(
+    "renameSync",
+    (original) => ((from: fs.PathLike, to: fs.PathLike) => {
+      if (failures === 1 && String(to).endsWith(".claim")) {
+        failures = 2;
+        throw fsError("EIO");
+      }
+      return original(from, to);
+    }) as typeof fs.renameSync,
+    async () => {
+      const result = await h.handler({}, paid(tok));
+      assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
+      assert.match(String(x402Error(result).message), /could not be recorded as paid/);
+      assert.equal(x402Error(result).retryAfterSeconds, 30);
+      assert.equal(h.events.includes("tool"), false);
+      assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+      assert.deepEqual(onlyClaim(h.claimsDir).paid, { tx: SIGNATURE, network: "solana" }, "the record says the payment is settled");
+      // Other arguments do not get the paid call.
+      assert.equal(errorCode(await h.handler({ x: "other" }, paid(tok))), "PAYMENT_ALREADY_USED");
+      const resumed = await h.handler({}, paid(tok));
+      assert.equal(resumed.isError, undefined);
+      assert.equal((resumed._meta?.["x402/payment-response"] as X402Settlement).transaction, SIGNATURE);
+    },
+  );
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+  assert.equal(h.events.filter((e) => e === "settle").length, 1, "the facilitator already answered: it is not asked again");
+  assert.ok(h.logs.some((l) => l.includes("resuming a settled payment whose call has not run")));
+  assert.equal(onlyClaim(h.claimsDir).s, "settled");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+});
+
+test("an owner that cannot read its own claim when the answer comes does not run the tool, and releases nothing it cannot see", async () => {
+  let unreadable = false;
+  const h = harness({
+    settleBody: async () => {
+      unreadable = true;
+      return SETTLED;
+    },
+  });
+  const tok = token("pay-u23");
+  await withFs(
+    "readFileSync",
+    (original) => ((file: unknown, ...rest: unknown[]) => {
+      if (unreadable && String(file).endsWith(".claim")) throw fsError("EIO");
+      return (original as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync,
+    async () => {
+      const result = await h.handler({}, paid(tok));
+      assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED);
+      assert.match(String(x402Error(result).message), /could not be recorded as paid/);
+      assert.equal(x402Error(result).retryAfterSeconds, 600);
+      assert.equal(x402Error(result).accepts, undefined);
+    },
+  );
+  assert.equal(h.events.includes("tool"), false);
+  assert.equal(onlyClaim(h.claimsDir).s, "settling", "the claim is still held");
+  assert.deepEqual(leftovers(h.claimsDir), []);
+  unreadable = false;
+  h.clock.now += 10 * 60 * 1000;
+  assert.equal((await h.handler({}, paid(tok))).isError, undefined);
+  assert.equal(h.events.filter((e) => e === "tool").length, 1);
+});
+
+test("resuming gets 20 seconds, and a readiness check that throws leaves the settlement as it is", async () => {
+  const timeouts: number[] = [];
+  let ready: () => string | null = () => null;
+  const h = harness({
+    settleBody: async (_body, timeoutMs) => {
+      timeouts.push(timeoutMs);
+      return PENDING;
+    },
+    preflight: () => ready(),
+  });
+  const tok = token("pay-u21");
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  timeouts.length = 0;
+  h.sleeps.length = 0;
+  assert.equal(errorCode(await h.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  assert.deepEqual(h.sleeps, [2000, 3000, 5000]);
+  assert.deepEqual(timeouts, [20000, 18000, 15000, 10000]);
+  assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+
+  timeouts.length = 0;
+  ready = () => {
+    throw new Error("browser exploded at C:\\secret\\path");
+  };
+  const refused = await h.handler({}, paid(tok));
+  assert.equal(errorCode(refused), SETTLEMENT_UNRESOLVED);
+  assert.match(String(x402Error(refused).message), /not ready to run this call yet/);
+  assert.doesNotMatch(JSON.stringify(refused), /exploded|secret/, "the cause stays in the log");
+  assert.ok(h.logs.some((l) => l.includes("preflight check threw, unresolved settlement left as it is") && l.includes("exploded")));
+  assert.deepEqual(timeouts, [], "the facilitator is not asked");
+  assert.equal(onlyClaim(h.claimsDir).s, "unresolved");
+});
+
+test("a call none of whose settle requests ever connected has sent nothing: that is a failure, not an open outcome", async () => {
+  const refusedConnection = async (): Promise<SettleReply> => {
+    throw new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" }) });
+  };
+  const h = harness({ settleBody: refusedConnection });
+  const tok = token("pay-u22");
+  const failed = await h.handler({}, paid(tok));
+  assert.equal(errorCode(failed), "SETTLEMENT_FAILED");
+  assert.ok(Array.isArray(x402Error(failed).accepts), "nothing was sent, so a new payment may be offered");
+  assert.equal(h.events.filter((e) => e === "settle").length, 7, "it kept trying for the whole 45 seconds first");
+  assert.deepEqual(claimFiles(h.claimsDir), []);
+  assert.ok(h.logs.some((l) => l.includes("settle failed, tool not run: reason=SETTLEMENT_FAILED (no reply") && l.includes("fetch failed")));
+
+  // Once any request may have arrived, the same silence leaves the outcome open.
+  let attempt = 0;
+  const later = harness({
+    settleBody: async () => {
+      if (++attempt === 1) throw new TypeError("fetch failed", { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+      return refusedConnection();
+    },
+  });
+  assert.equal(errorCode(await later.handler({}, paid(token("pay-u22b")))), SETTLEMENT_UNRESOLVED);
+  assert.equal(onlyClaim(later.claimsDir).s, "unresolved");
+  // And on a resume, silence never releases: an earlier call already sent the request.
+  attempt = 1;
+  assert.equal(errorCode(await later.handler({}, paid(token("pay-u22b")))), SETTLEMENT_UNRESOLVED);
+  assert.equal(onlyClaim(later.claimsDir).s, "unresolved");
 });
 
 test("a tool that fails after settlement is reported as paid and logged", async () => {
@@ -640,7 +1433,7 @@ test("a failed fee-payer lookup is not cached, so the next call asks again", asy
         return { kinds: [{ scheme: "exact", network: "solana", extra: { feePayer: walletOf("fee-payer") } }] };
       },
       verify: async () => ({ isValid: true }),
-      settle: async () => ({ success: true, transaction: "sig", network: "solana" }),
+      settleBody: async () => ({ success: true, transaction: "sig", network: "solana" }),
     },
     claimsDir: tempDir(),
     log: () => {},
