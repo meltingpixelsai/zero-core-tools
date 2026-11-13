@@ -27,9 +27,13 @@
  * caller gets it with the answer that the outcome is unknown (`resumeCode`),
  * to present as `_meta["x402/resume"]` or an X-PAYMENT-RESUME header. A payment
  * is public once it is on chain and a call's arguments can sometimes be guessed;
- * the code is known only to whoever received that answer. A call that was cut
- * off before it could answer has handed out no code, so its settlement cannot
- * be resumed.
+ * the code is known only to whoever received that answer. A caller may also
+ * choose the code itself and send it the same way with its first call: that
+ * call's settlement can then be resumed even if the call is cut off before it
+ * answers. A call that was cut off and carried no code of the caller's own has
+ * handed out none, so its settlement cannot be resumed.
+ * A call is answered inside about 50 seconds whatever the facilitator does, so
+ * that a caller with the usual 60-second limit gets the answer, and the code.
  * A tool may name a readiness check (`preflight`) for what it depends on; it
  * runs between 2 and 3, and a refusal releases the claim and settles nothing.
  * Claims are marker files in one directory shared by every server that takes
@@ -136,6 +140,10 @@ export interface SettleFirstDeps {
   info?: (line: string) => void;
   /** The wait between two settle requests for one payment. Default: a timer. */
   sleep?: (ms: number) => Promise<void>;
+  /** How long the facilitator's answer to a verify request is waited for. Default: 15 seconds. */
+  verifyTimeoutMs?: number;
+  /** The same for its list of supported payment kinds (the fee payers). Default: 10 seconds. */
+  supportedTimeoutMs?: number;
 }
 
 /** The error code of a call whose payment may or may not have been taken. Its result offers no new payment. */
@@ -151,6 +159,18 @@ const PRUNE_EVERY_MS = 10 * 60 * 1000;
 const SETTLE_BUDGET_MS = 45 * 1000;
 /** The same for a call that presents a payment whose settlement an earlier call left unresolved. */
 const SETTLE_AGAIN_BUDGET_MS = 20 * 1000;
+/**
+ * A call's settle requests also stop this long after the call came in, whatever verify and the readiness check took
+ * of it: the answer, and with it the resume code, must reach a caller whose own limit for a call is 60 seconds. One
+ * settle request is always made (SETTLE_REQUEST_MIN_MS), so the answer can come a few seconds later than this.
+ */
+const CALL_BUDGET_MS = 50 * 1000;
+/**
+ * How long the facilitator's answer to verify, and to supported, is waited for. Neither request moves money, so one
+ * that is given up on is a refusal with nothing taken.
+ */
+const VERIFY_TIMEOUT_MS = 15 * 1000;
+const SUPPORTED_TIMEOUT_MS = 10 * 1000;
 /** No settle request is given less time than this, however little of the budget is left. */
 const SETTLE_REQUEST_MIN_MS = 3 * 1000;
 /** Waits between the settle requests of one call; the last one repeats. */
@@ -210,13 +230,22 @@ const unresolvedMessage = (withCode: boolean): string =>
   `Present the same payment with the same call again${withCode ? `, ${HOW_TO_RESUME},` : ""} to get the result, or a definite answer that nothing was taken.`;
 const IN_PROGRESS_MESSAGE =
   "An earlier call with this payment is still in progress. Do not send a new payment for this call. " +
-  "That call's answer carries the result, or a resume code to present with the same payment and the same call.";
+  "That call's answer carries the result, or a resume code to present with the same payment and the same call. " +
+  "If that call was cut off and carried a resume code of your own, present the same payment, the same call and that code again in ten minutes.";
 const notRecordedMessage = (withCode: boolean): string =>
   "This payment was settled, but the call could not be recorded as paid, so it was not run. Do not send a new payment for this call. " +
   `Present the same payment with the same call again after the time given${withCode ? `, ${HOW_TO_RESUME},` : ""} to get the result.`;
 const RESUME_CODE_MESSAGE =
   "The outcome of this payment is not known, and this call did not present the payment's resume code. Do not send a new payment for this call. " +
-  `The call that sent the payment for settlement was given a resume code with its answer: present the same payment with the same call and that code as _meta["${RESUME_META_KEY}"] (or the ${RESUME_HEADER} header).`;
+  `The call that sent the payment for settlement was given a resume code with its answer, or sent one of its own: present the same payment with the same call and that code as _meta["${RESUME_META_KEY}"] (or the ${RESUME_HEADER} header).`;
+/** Sent with every offer of a payment: how a caller keeps its way back to a call that is cut off. */
+const RESUME_HINT = {
+  meta: RESUME_META_KEY,
+  header: RESUME_HEADER,
+  note:
+    "Optional. Send 32 random bytes as base64url (43 characters), new for each payment, with the paid call. " +
+    "If the call is cut off, or answers SETTLEMENT_UNRESOLVED, the same payment, the same call and that code get the result without a second payment.",
+};
 const CLAIM_UNAVAILABLE_MESSAGE = "The service cannot record payments right now, so this call sent nothing for settlement. Try again later.";
 const CLAIM_UNREADABLE_MESSAGE =
   "The service cannot read this payment's record right now. Do not send a new payment for this call. Present the same payment with the same call again later.";
@@ -444,16 +473,18 @@ export class ClaimStore {
    * The claimant has verified the payment and is about to send it for settlement: record the call and the exact
    * request, so the settlement can be resumed if this call cannot finish it, and the hash of a new resume code, so
    * that only a caller this call has answered can resume it. Returns the mark that makes this call the settlement's
-   * owner with that code, or null when the record could not be written (nothing has been sent then).
+   * owner with that code, or null when the record could not be written (nothing has been sent then). `chosen`: the
+   * code the caller sent with this first presentation of the payment; it is used instead of a new one, so a caller
+   * whose call is cut off before the answer still holds the code.
    */
-  markSettling(key: string, call: string, body: string): OwnedSettlement | null {
+  markSettling(key: string, call: string, body: string, chosen?: string): OwnedSettlement | null {
     if (body.length > MAX_SETTLE_BODY_LENGTH) {
       // A record this long could not be read back, and a settlement that cannot be resumed is not started.
       this.log(`[x402] settle request too long to record (${body.length} characters): shorten the tool's description`);
       return null;
     }
     const owner = randomUUID();
-    const code = newResumeCode();
+    const code = chosen !== undefined && RESUME_CODE_PATTERN.test(chosen) ? chosen : newResumeCode();
     const now = this.now();
     try {
       this.write(key, { s: "settling", t: now, f: now, o: owner, call, body, rc: resumeCodeHash(code) });
@@ -899,6 +930,26 @@ function neverSent(err: unknown): boolean {
   return code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_CONNECT_TIMEOUT";
 }
 
+/** A facilitator request that moves no money (verify, supported) was given up on after its time limit. */
+class FacilitatorTimeout extends Error {}
+
+/** `work`'s result, or a FacilitatorTimeout after `ms`. The request itself is not stopped; its late answer is dropped. */
+function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new FacilitatorTimeout(`${what}: no answer in ${ms} ms`)), ms);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 /**
  * Build a paid-tool registrar. Create it once per process (it holds the claim
  * store), then bind it to each MCP server instance: `settleFirst(server)`.
@@ -918,6 +969,8 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
     settleBody: (body, timeoutMs) => postSettle(cfg.facilitator.url, body, timeoutMs),
   };
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const verifyTimeoutMs = deps.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS;
+  const supportedTimeoutMs = deps.supportedTimeoutMs ?? SUPPORTED_TIMEOUT_MS;
   const claimsDir = deps.claimsDir ?? (process.env.X402_CLAIMS_DIR || path.join(os.homedir(), ".x402-claims"));
   const claims = new ClaimStore(claimsDir, now, log);
   (deps.info ?? ((line: string) => console.log(line)))(`[x402] settle-first paid tools; payment claims in ${claimsDir}`);
@@ -926,11 +979,11 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
    * Asks the facilitator to settle `body` until it gives a final answer or the call's time for this is used up.
    * Every request carries the identical body: the facilitator settles a payment once and answers a repeat with the
    * recorded outcome. `again`: an earlier call already sent this body; `known` is the transaction the facilitator
-   * named to that call, if it named one.
+   * named to that call, if it named one. `callDeadline`: when the call as a whole is to be answered.
    */
-  async function resolveSettlement(body: string, again: boolean, known: string): Promise<SettleOutcome> {
+  async function resolveSettlement(body: string, again: boolean, known: string, callDeadline: number): Promise<SettleOutcome> {
     const budget = again ? SETTLE_AGAIN_BUDGET_MS : SETTLE_BUDGET_MS;
-    const deadline = now() + budget;
+    const deadline = Math.min(now() + budget, callDeadline);
     let transaction = known;
     // Whether the facilitator may already have had this body. Until it may, an outright refusal is a final answer.
     let mayHaveArrived = again;
@@ -1000,7 +1053,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
     if (feePayerCache && now() - feePayerCache.at < FEE_PAYER_TTL_MS) return Promise.resolve(feePayerCache.byNetwork);
     if (!feePayersInFlight) {
       const pending = (async () => {
-        const { kinds } = await facilitator.supported();
+        const { kinds } = await withTimeout(facilitator.supported(), supportedTimeoutMs, "supported");
         const byNetwork = new Map<string, string>();
         for (const kind of kinds) {
           const feePayer = kind.extra?.feePayer;
@@ -1077,6 +1130,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
       options: PaidToolOptions<A> = {},
     ): unknown {
       return registrar.tool(name, description, paramsSchema, { ...annotations, ...annotationsFor(price) }, async (args: A, extra: unknown) => {
+        const callDeadline = now() + CALL_BUDGET_MS;
         if (options.precheck) {
           const problem = await options.precheck(args);
           if (problem) return { isError: true, content: [{ type: "text", text: `Error: ${problem}` }] };
@@ -1085,7 +1139,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         const accepts = await buildRequirements(name, description, price);
         if (!accepts.length) return errorResult({ x402Version, error: "PRICE_COMPUTE_FAILED" });
         const paymentRequired = (reason = "PAYMENT_REQUIRED", fields: Record<string, unknown> = {}) =>
-          errorResult({ x402Version, error: reason, accepts, ...fields });
+          errorResult({ x402Version, error: reason, accepts, resume: RESUME_HINT, ...fields });
 
         const token = readPaymentToken(extra);
         if (!token) return paymentRequired();
@@ -1106,6 +1160,9 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         if (!key || !payer || payer === feePayer) return paymentRequired("INVALID_PAYMENT");
 
         const call = paidCallId(name, args);
+        // The resume code this call presents: the code of an unresolved settlement it wants resumed, or, with a
+        // payment's first presentation, the code the caller chooses for it.
+        const resumeCode = readResumeCode(extra);
         /**
          * The outcome of the payment is not known. No `accepts`: a client must not be led to pay a second time.
          * `resumeCode`: only from a call that owns, or owned, the payment's settlement.
@@ -1135,7 +1192,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         const settleAndRun = async ({ owner, code }: OwnedSettlement, body: string, again: boolean, known = "", paid?: PaidMark): Promise<ToolResult> => {
           const open = (transaction: string, message = unresolvedMessage(code !== undefined), retryAfterSeconds = UNRESOLVED_RETRY_SECONDS): ToolResult =>
             unresolved(transaction, message, retryAfterSeconds, code);
-          const outcome: SettleOutcome = paid ? { kind: "settled", transaction: paid.tx, network: paid.network } : await resolveSettlement(body, again, known);
+          const outcome: SettleOutcome = paid ? { kind: "settled", transaction: paid.tx, network: paid.network } : await resolveSettlement(body, again, known, callDeadline);
           const tx = brief(outcome.transaction) || "-";
           if (outcome.kind === "failed") {
             const ended = await endClaim(key, owner, { s: "released" });
@@ -1199,7 +1256,6 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           // The payment is claimed. For any other call it is in use or used up. For this same call it is either
           // still at work (no new payment is offered while it may yet be taken) or was left unresolved: resume it,
           // if the caller holds the payment's resume code.
-          const resumeCode = readResumeCode(extra);
           const denied = (): ToolResult => {
             const why = resumeCode ? "wrong resume code" : "no resume code";
             if (deniedLogDue(`${key}:${why}`)) log(`[x402] ${name}: an unresolved settlement was not resumed: ${why} payer=${payer}`);
@@ -1235,10 +1291,11 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
 
         let verified: VerifyResponse;
         try {
-          verified = await facilitator.verify(decoded, selected);
-        } catch {
+          verified = await withTimeout(facilitator.verify(decoded, selected), verifyTimeoutMs, "verify");
+        } catch (err) {
           claims.release(key);
           refreshFeePayerSoon();
+          if (err instanceof FacilitatorTimeout) log(`[x402] ${name}: ${err.message}, payment refused unpaid (nothing was sent for settlement) payer=${payer}`);
           return paymentRequired("VERIFY_FAILED");
         }
         if (!verified.isValid) {
@@ -1268,7 +1325,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           paymentPayload: toJsonSafe(decoded),
           paymentRequirements: toJsonSafe(selected),
         });
-        const owned = claims.markSettling(key, call, body);
+        const owned = claims.markSettling(key, call, body, resumeCode);
         if (!owned) {
           claims.release(key);
           log(`[x402] ${name}: payment claim store unavailable, payment not sent for settlement, tool not run payer=${payer}`);
