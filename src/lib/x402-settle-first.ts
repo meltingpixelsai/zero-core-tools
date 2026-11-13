@@ -242,7 +242,7 @@ const RESUME_CODE_MESSAGE =
   "The outcome of this payment is not known, and this call did not present the payment's resume code. Do not send a new payment for this call. " +
   `The call that sent the payment for settlement was given a resume code with its answer, or sent one of its own: present the same payment with the same call and that code as _meta["${RESUME_META_KEY}"] (or the ${RESUME_HEADER} header).`;
 const INVALID_RESUME_CODE_MESSAGE =
-  `The resume code sent with this call (_meta["${RESUME_META_KEY}"] or the ${RESUME_HEADER} header) is not 43 base64url characters (32 random bytes, no padding). ` +
+  `A resume code sent with this call is not 43 base64url characters (32 random bytes, no padding). Both _meta["${RESUME_META_KEY}"] and the ${RESUME_HEADER} header are checked, and a header sent twice arrives as one value. ` +
   "Nothing was done with the payment by this call. Send the call again with a code in that form, or with none.";
 /** Sent with every offer of a payment: how a caller keeps its way back to a call that is cut off. */
 const RESUME_HINT = {
@@ -250,7 +250,7 @@ const RESUME_HINT = {
   header: RESUME_HEADER,
   note:
     "Optional. Send 32 random bytes as base64url (43 characters, no padding), new for each payment, with the paid call. " +
-    "If the call answers SETTLEMENT_UNRESOLVED, or is cut off before its payment was settled, the same payment, the same call and that code resume it without a second payment. " +
+    "If the call answers SETTLEMENT_UNRESOLVED, or is cut off before its payment was settled, the same payment, the same call and that code, presented within 23 hours, get the result or a definite answer that nothing was taken. " +
     "A call that has run is not run again and its result is not sent again.",
 };
 const CLAIM_UNAVAILABLE_MESSAGE = "The service cannot record payments right now, so this call sent nothing for settlement. Try again later.";
@@ -844,11 +844,13 @@ export function readResumeCode(extra: unknown): string | undefined {
 /**
  * Whether a call carries something where a resume code goes (`_meta` or the header) that is not shaped like one.
  * Such a call is refused before anything is claimed: a caller that sent its own code in a wrong form (base64 with
- * padding, say) would otherwise be given a code it may never receive, and find its own refused later.
+ * padding, say) would otherwise be given a code it may never receive, and find its own refused later. An empty
+ * value is no value: a client that always sends the header, empty when it has no code, pays as before.
  */
 export function hasMisshapenResumeCode(extra: unknown): boolean {
   const ex = (extra ?? {}) as { _meta?: Record<string, unknown>; requestInfo?: { headers?: unknown } };
-  const misshapen = (value: unknown): boolean => value !== undefined && value !== null && !(typeof value === "string" && RESUME_CODE_PATTERN.test(value));
+  const misshapen = (value: unknown): boolean =>
+    value !== undefined && value !== null && !(typeof value === "string" && (value.trim() === "" || RESUME_CODE_PATTERN.test(value)));
   if (misshapen(ex._meta?.[RESUME_META_KEY])) return true;
   const headers = ex.requestInfo?.headers;
   if (!headers) return false;

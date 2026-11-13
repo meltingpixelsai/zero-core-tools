@@ -153,6 +153,7 @@ function assertMisshapen(result: ToolResult): void {
   assert.equal(x402Error(result).accepts, undefined, "the payment may be one whose outcome is not known: none is offered");
   assert.equal(x402Error(result).resumeCode, undefined);
   assert.match(String(x402Error(result).message), /is not 43 base64url characters/);
+  assert.match(String(x402Error(result).message), /Both _meta\["x402\/resume"\] and the X-PAYMENT-RESUME header are checked/);
   assert.match(String(x402Error(result).message), /Nothing was done with the payment by this call/);
 }
 /** A well-formed resume code that is no payment's. */
@@ -542,7 +543,7 @@ test("an unresolved payment is not resumed without its resume code, whoever pres
   assertMisshapen(await h.handler({ x: "a" }, resume(tok, code + "A")));
   assertMisshapen(await h.handler({ x: "a" }, resume(tok, sha256hex(code))));
   assertMisshapen(await h.handler({ x: "a" }, { _meta: { "x402/payment": tok, "x402/resume": { code } } }));
-  assertMisshapen(await h.handler({ x: "a" }, { _meta: { "x402/payment": tok, "x402/resume": code }, requestInfo: { headers: new Headers({ "X-PAYMENT-RESUME": "" }) } }));
+  assertMisshapen(await h.handler({ x: "a" }, { _meta: { "x402/payment": tok, "x402/resume": code }, requestInfo: { headers: new Headers({ "X-PAYMENT-RESUME": "nope" }) } }));
   assert.equal(h.events.filter((e) => e === "settle").length, asked, "the facilitator is not asked");
   assert.equal(h.events.includes("tool"), false);
   assert.equal(fs.readFileSync(file, "utf8"), before, "the claim is untouched");
@@ -816,6 +817,7 @@ test("every offer of a payment says how a caller keeps its way back; an answer a
   assert.match(hint.note, /32 random bytes as base64url \(43 characters, no padding\), new for each payment/);
   // It promises a way back to a call whose payment was not settled, and says plainly that a call that ran is over.
   assert.match(hint.note, /answers SETTLEMENT_UNRESOLVED, or is cut off before its payment was settled/);
+  assert.match(hint.note, /presented within 23 hours, get the result or a definite answer that nothing was taken/);
   assert.match(hint.note, /A call that has run is not run again and its result is not sent again/);
   assert.deepEqual(x402Error(await h.handler({}, paid("not-a-payment"))).resume, hint);
   const unresolved = x402Error(await h.handler({}, paid(token("pay-hint1"))));
@@ -833,7 +835,7 @@ test("something that is not a resume code where one goes refuses the call before
   for (const extra of [
     resume(tok, padded),
     resume(tok, "my-password"),
-    resume(tok, ""),
+    resume(tok, WRONG_CODE + ", " + WRONG_CODE),
     { _meta: { "x402/payment": tok, "x402/resume": 42 } },
     { _meta: { "x402/payment": tok }, requestInfo: { headers: new Headers({ "X-PAYMENT-RESUME": padded }) } },
     { _meta: { "x402/payment": tok }, requestInfo: { headers: { "x-payment-resume": [WRONG_CODE] } } },
@@ -859,6 +861,16 @@ test("something that is not a resume code where one goes refuses the call before
   assert.equal(hasMisshapenResumeCode(undefined), false);
   assert.equal(hasMisshapenResumeCode({ _meta: { "x402/resume": WRONG_CODE } }), false);
   assert.equal(hasMisshapenResumeCode({ _meta: { "x402/resume": null } }), false, "null is no value");
+  // Nor is an empty one: a client that always sends the header, empty when it has no code, pays as before.
+  assert.equal(hasMisshapenResumeCode({ _meta: { "x402/resume": "" } }), false);
+  assert.equal(hasMisshapenResumeCode({ requestInfo: { headers: { "x-payment-resume": "" } } }), false);
+  assert.equal(hasMisshapenResumeCode({ requestInfo: { headers: new Headers({ "X-PAYMENT-RESUME": "   " }) } }), false);
+  assert.equal(hasMisshapenResumeCode({ _meta: { "x402/resume": "" }, requestInfo: { headers: { "x-payment-resume": WRONG_CODE } } }), false);
+  assert.equal(readResumeCode({ _meta: { "x402/resume": "" }, requestInfo: { headers: { "x-payment-resume": WRONG_CODE } } }), WRONG_CODE);
+  const empty = harness();
+  const paidWithEmpty = await empty.handler({}, { _meta: { "x402/payment": token("pay-ms2"), "x402/resume": "" }, requestInfo: { headers: { "x-payment-resume": "" } } });
+  assert.equal(paidWithEmpty.isError, undefined);
+  assert.deepEqual(paymentEvents(empty.events), ["verify", "settle", "tool"]);
   assert.equal(hasMisshapenResumeCode({ requestInfo: { headers: new Headers() } }), false);
   assert.equal(hasMisshapenResumeCode({ requestInfo: { headers: { "X-PAYMENT-RESUME": WRONG_CODE } } }), false);
   assert.equal(hasMisshapenResumeCode({ _meta: { "x402/resume": WRONG_CODE }, requestInfo: { headers: { "x-payment-resume": "nope" } } }), true);
