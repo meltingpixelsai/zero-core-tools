@@ -7,12 +7,19 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { encodePayment } from "x402/schemes";
+import { decodePayment, encodePayment } from "x402/schemes";
+import { paidCallId, paymentClaimKey } from "./lib/x402-settle-first.js";
 
 // Starts the real server (src/index.ts through tsx) with a stand-in facilitator whose /settle answers follow a
 // script, over real HTTP: a settle that is not finally answered (HTTP 503, "settlement_pending", a 502 page) must
 // be asked about again with the identical body and must not be reported as failed, and an outright refusal must.
+// An unresolved settlement is resumed only with its resume code, sent as _meta or as a header.
 // No real payment, and nothing leaves 127.0.0.1: the paid tool stops at its missing API key.
+
+/** The paid tool this test calls, its arguments, and what its answer says once it has run (it stops before its upstream). */
+const TOOL = "analyze_sentiment";
+const ARGS = { text: "settle test" };
+const RAN = /XAI_API_KEY not configured/;
 
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
@@ -25,7 +32,7 @@ function freePort(): Promise<number> {
 }
 
 /** POST one JSON-RPC body to /mcp; the full response text, or "no answer" after `timeoutMs`. */
-function rpc(port: number, body: string, timeoutMs: number): Promise<string> {
+function rpc(port: number, body: string, timeoutMs: number, extraHeaders: Record<string, string> = {}): Promise<string> {
   return new Promise((resolve) => {
     const req = http.request(
       {
@@ -34,7 +41,7 @@ function rpc(port: number, body: string, timeoutMs: number): Promise<string> {
         method: "POST",
         path: "/mcp",
         agent: false,
-        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...extraHeaders },
       },
       (res) => {
         let text = "";
@@ -90,7 +97,9 @@ interface Started {
   bodies: string[];
   verifies: () => number;
   out: () => string;
-  call: (token: string) => Promise<string>;
+  /** One paid call; `resume` adds a resume code as _meta["x402/resume"], `header` as the X-PAYMENT-RESUME header. */
+  call: (token: string, how?: { resume?: string; header?: string }) => Promise<string>;
+  claimsDir: string;
 }
 
 async function startServer(t: TestContext): Promise<Started> {
@@ -139,8 +148,10 @@ async function startServer(t: TestContext): Promise<Started> {
       PAYMENT_WALLET: "Recipient11111111111111111111111111111111111",
       X402_CLAIMS_DIR: path.join(tmp, "claims"),
       // Set, and empty: dotenv leaves a variable that is already set alone, so a .env beside the checkout cannot
-      // hand the tool a real key.
+      // hand the tool a real key or a real database.
       XAI_API_KEY: "",
+      SUPABASE_URL: "",
+      SUPABASE_SERVICE_ROLE_KEY: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -158,20 +169,25 @@ async function startServer(t: TestContext): Promise<Started> {
     assert.equal(child.exitCode, null, "the server exited at startup:\n" + out.slice(-600));
     await new Promise((r) => setTimeout(r, 200));
   }
-  const call = (token: string) =>
-    rpc(port, json({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "analyze_sentiment", arguments: { text: "settle test" }, _meta: { "x402/payment": token } } }), 30_000);
-  return { script, bodies, verifies: () => verifies, out: () => out, call };
+  const call = (token: string, how: { resume?: string; header?: string } = {}) =>
+    rpc(
+      port,
+      json({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: TOOL, arguments: ARGS, _meta: { "x402/payment": token, ...(how.resume !== undefined ? { "x402/resume": how.resume } : {}) } } }),
+      30_000,
+      how.header !== undefined ? { "X-PAYMENT-RESUME": how.header } : {},
+    );
+  return { script, bodies, verifies: () => verifies, out: () => out, call, claimsDir: path.join(tmp, "claims") };
 }
 
 test("through the real server: a settle without a final answer is asked about again with the same body, and only a definite refusal offers a new payment", async (t) => {
-  const { script, bodies, verifies, out, call } = await startServer(t);
+  const { script, bodies, verifies, out, call, claimsDir } = await startServer(t);
   const phase = (...answers: Answer[]) => {
     script.splice(0, script.length, ...answers);
     bodies.length = 0;
   };
   const paidAndRan = (answer: string) => {
     assert.match(answer, /x402\/payment-response/, answer.slice(0, 400));
-    assert.match(answer, /XAI_API_KEY not configured/, "the tool ran, and stopped before calling its upstream");
+    assert.match(answer, RAN, "the tool ran, and stopped before calling its upstream");
     assert.doesNotMatch(answer, /x402\/error/);
   };
 
@@ -188,7 +204,7 @@ test("through the real server: a settle without a final answer is asked about ag
   assert.equal(sent.paymentPayload.scheme, "exact");
   assert.equal(sent.paymentPayload.payload.transaction, paymentTransaction(seed));
   assert.equal(sent.paymentRequirements.payTo, "Recipient11111111111111111111111111111111111");
-  assert.equal(sent.paymentRequirements.resource, "mcp://analyze_sentiment");
+  assert.equal(sent.paymentRequirements.resource, `mcp://${TOOL}`);
   assert.equal(verifies(), 1);
 
   // 2. A 502 page that is not JSON, then success: the same.
@@ -213,7 +229,62 @@ test("through the real server: a settle without a final answer is asked about ag
   assert.match(expired, /accepts/);
   assert.equal(bodies.length, 2);
 
-  assert.match(out(), /settle failed, tool not run: reason=free_tier_exhausted/);
-  assert.match(out(), /settle failed, tool not run: reason=invalid_transaction_state/);
+  // The server's log arrives through a pipe, a moment after the HTTP answer it belongs to: wait for a line, don't
+  // read once.
+  const logged = async (line: RegExp, times = 1) => {
+    const count = () => (out().match(new RegExp(line.source, "g")) ?? []).length;
+    for (let waited = 0; count() < times && waited < 5_000; waited += 50) await new Promise((r) => setTimeout(r, 50));
+    return count();
+  };
+  assert.equal(await logged(/settle failed, tool not run: reason=free_tier_exhausted/), 1);
+  assert.equal(await logged(/settle failed, tool not run: reason=invalid_transaction_state/), 1);
   assert.doesNotMatch(out(), /settlement unresolved/);
+
+  // 5. An unresolved settlement, as an earlier call would have left it after 45 seconds of no final answer (the
+  //    record is written here to spare the wait): the same call resumes it only with the payment's resume code,
+  //    which reaches the server as _meta["x402/resume"] or as the X-PAYMENT-RESUME header.
+  const unresolvedClaim = (token: string, code: string, body: string) => {
+    const file = path.join(claimsDir, `${paymentClaimKey(decodePayment(token))}.claim`);
+    const now = Date.now();
+    fs.writeFileSync(file, json({ s: "unresolved", t: now, f: now, call: paidCallId(TOOL, ARGS), body, rc: createHash("sha256").update(code).digest("hex") }));
+    return file;
+  };
+  const notResumed = (answer: string) => {
+    assert.match(answer, /SETTLEMENT_UNRESOLVED/, answer.slice(0, 400));
+    assert.match(answer, /did not present the payment's resume code/);
+    assert.doesNotMatch(answer, /accepts/, "no new payment is offered");
+    assert.doesNotMatch(answer, /resumeCode/, "a call without the code is given none");
+    assert.doesNotMatch(answer, /x402\/payment-response/);
+  };
+  const code = "r".repeat(43);
+  const wrong = "w".repeat(43);
+  for (const [seed, how] of [
+    ["settle-e", (c: string) => ({ resume: c })],
+    ["settle-f", (c: string) => ({ header: c })],
+  ] as const) {
+    phase(SUCCESS);
+    const token = paymentToken(`${seed}-${Date.now()}`);
+    const recordedBody = json({ recorded: seed });
+    const file = unresolvedClaim(token, code, recordedBody);
+    const before = fs.readFileSync(file, "utf8");
+    const verified = verifies();
+    notResumed(await call(token));
+    notResumed(await call(token, how(wrong)));
+    const misshapen = await call(token, how(code.slice(1)));
+    assert.match(misshapen, /INVALID_RESUME_CODE/, misshapen.slice(0, 400));
+    assert.doesNotMatch(misshapen, /accepts/, "no new payment is offered");
+    assert.doesNotMatch(misshapen, /x402\/payment-response/);
+    assert.equal(bodies.length, 0, "the facilitator is not asked");
+    assert.equal(fs.readFileSync(file, "utf8"), before, "the claim is untouched");
+    paidAndRan(await call(token, how(code)));
+    assert.deepEqual(bodies, [recordedBody], "one settle request, with the recorded body");
+    assert.equal(verifies(), verified, "a resumed settlement is not verified again");
+    assert.equal((JSON.parse(fs.readFileSync(file, "utf8")) as { s: string }).s, "settled");
+    assert.match(await call(token, how(code)), /PAYMENT_ALREADY_USED/);
+  }
+  // Logged once per claim and reason (a misshapen code is refused before the claim is looked at, and not logged).
+  assert.equal(await logged(/an unresolved settlement was not resumed: no resume code/, 2), 2);
+  assert.equal(await logged(/an unresolved settlement was not resumed: wrong resume code/, 2), 2);
+  assert.equal(await logged(/asking again about an unresolved settlement/, 2), 2);
+  assert.equal(out().includes(code) || out().includes(wrong), false, "no resume code is ever logged");
 });
