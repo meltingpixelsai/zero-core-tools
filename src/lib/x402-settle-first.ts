@@ -30,7 +30,8 @@
  * the code is known only to whoever received that answer. A caller may also
  * choose the code itself and send it the same way with its first call: that
  * call's settlement can then be resumed even if the call is cut off before it
- * answers. A call that was cut off and carried no code of the caller's own has
+ * answers. Something in the code's place that is not shaped like a code
+ * refuses the call before anything is claimed. A call that was cut off and carried no code of the caller's own has
  * handed out none, so its settlement cannot be resumed.
  * A call is answered inside about 50 seconds whatever the facilitator does, so
  * that a caller with the usual 60-second limit gets the answer, and the code.
@@ -148,6 +149,8 @@ export interface SettleFirstDeps {
 
 /** The error code of a call whose payment may or may not have been taken. Its result offers no new payment. */
 export const SETTLEMENT_UNRESOLVED = "SETTLEMENT_UNRESOLVED";
+/** The error code of a call that carries something that is not a resume code where one goes. Nothing is claimed. */
+export const INVALID_RESUME_CODE = "INVALID_RESUME_CODE";
 
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
 const PRUNE_EVERY_MS = 10 * 60 * 1000;
@@ -238,13 +241,17 @@ const notRecordedMessage = (withCode: boolean): string =>
 const RESUME_CODE_MESSAGE =
   "The outcome of this payment is not known, and this call did not present the payment's resume code. Do not send a new payment for this call. " +
   `The call that sent the payment for settlement was given a resume code with its answer, or sent one of its own: present the same payment with the same call and that code as _meta["${RESUME_META_KEY}"] (or the ${RESUME_HEADER} header).`;
+const INVALID_RESUME_CODE_MESSAGE =
+  `The resume code sent with this call (_meta["${RESUME_META_KEY}"] or the ${RESUME_HEADER} header) is not 43 base64url characters (32 random bytes, no padding). ` +
+  "Nothing was done with the payment by this call. Send the call again with a code in that form, or with none.";
 /** Sent with every offer of a payment: how a caller keeps its way back to a call that is cut off. */
 const RESUME_HINT = {
   meta: RESUME_META_KEY,
   header: RESUME_HEADER,
   note:
-    "Optional. Send 32 random bytes as base64url (43 characters), new for each payment, with the paid call. " +
-    "If the call is cut off, or answers SETTLEMENT_UNRESOLVED, the same payment, the same call and that code get the result without a second payment.",
+    "Optional. Send 32 random bytes as base64url (43 characters, no padding), new for each payment, with the paid call. " +
+    "If the call answers SETTLEMENT_UNRESOLVED, or is cut off before its payment was settled, the same payment, the same call and that code resume it without a second payment. " +
+    "A call that has run is not run again and its result is not sent again.",
 };
 const CLAIM_UNAVAILABLE_MESSAGE = "The service cannot record payments right now, so this call sent nothing for settlement. Try again later.";
 const CLAIM_UNREADABLE_MESSAGE =
@@ -834,6 +841,27 @@ export function readResumeCode(extra: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Whether a call carries something where a resume code goes (`_meta` or the header) that is not shaped like one.
+ * Such a call is refused before anything is claimed: a caller that sent its own code in a wrong form (base64 with
+ * padding, say) would otherwise be given a code it may never receive, and find its own refused later.
+ */
+export function hasMisshapenResumeCode(extra: unknown): boolean {
+  const ex = (extra ?? {}) as { _meta?: Record<string, unknown>; requestInfo?: { headers?: unknown } };
+  const misshapen = (value: unknown): boolean => value !== undefined && value !== null && !(typeof value === "string" && RESUME_CODE_PATTERN.test(value));
+  if (misshapen(ex._meta?.[RESUME_META_KEY])) return true;
+  const headers = ex.requestInfo?.headers;
+  if (!headers) return false;
+  if (typeof (headers as { get?: unknown }).get === "function") {
+    return misshapen((headers as { get: (name: string) => string | null }).get(RESUME_HEADER));
+  }
+  if (typeof headers === "object") {
+    const rec = headers as Record<string, unknown>;
+    return misshapen(rec[RESUME_HEADER] ?? rec[RESUME_HEADER.toLowerCase()]);
+  }
+  return false;
+}
+
 function errorResult(payload: Record<string, unknown>): ToolResult {
   return {
     isError: true,
@@ -1029,13 +1057,18 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
 
   /**
    * A call that may not resume a settlement costs the caller nothing, so it is logged once per claim and reason in
-   * DENIED_LOG_EVERY_MS, not once per call. The memory of what was logged is bounded.
+   * DENIED_LOG_EVERY_MS, not once per call; so is a verify that was given up on. The memory of what was logged is
+   * bounded: past DENIED_LOG_MAX_ENTRIES the oldest entry is forgotten.
    */
   const deniedLogged = new Map<string, number>();
   function deniedLogDue(what: string): boolean {
     const last = deniedLogged.get(what);
     if (last !== undefined && now() - last < DENIED_LOG_EVERY_MS) return false;
-    if (deniedLogged.size >= DENIED_LOG_MAX_ENTRIES) deniedLogged.clear();
+    deniedLogged.delete(what);
+    if (deniedLogged.size >= DENIED_LOG_MAX_ENTRIES) {
+      const oldest = deniedLogged.keys().next();
+      if (!oldest.done) deniedLogged.delete(oldest.value);
+    }
     deniedLogged.set(what, now());
     return true;
   }
@@ -1161,7 +1194,10 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
 
         const call = paidCallId(name, args);
         // The resume code this call presents: the code of an unresolved settlement it wants resumed, or, with a
-        // payment's first presentation, the code the caller chooses for it.
+        // payment's first presentation, the code the caller chooses for it. Something else in its place refuses the
+        // call here, before the payment is claimed, verified or looked up. No `accepts`: the payment may be one whose
+        // outcome is not known.
+        if (hasMisshapenResumeCode(extra)) return errorResult({ x402Version, error: INVALID_RESUME_CODE, message: INVALID_RESUME_CODE_MESSAGE });
         const resumeCode = readResumeCode(extra);
         /**
          * The outcome of the payment is not known. No `accepts`: a client must not be led to pay a second time.
@@ -1295,7 +1331,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         } catch (err) {
           claims.release(key);
           refreshFeePayerSoon();
-          if (err instanceof FacilitatorTimeout) log(`[x402] ${name}: ${err.message}, payment refused unpaid (nothing was sent for settlement) payer=${payer}`);
+          if (err instanceof FacilitatorTimeout && deniedLogDue("verify: no answer")) log(`[x402] ${name}: ${err.message}, payment refused unpaid (nothing was sent for settlement) payer=${payer}`);
           return paymentRequired("VERIFY_FAILED");
         }
         if (!verified.isValid) {

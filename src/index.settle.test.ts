@@ -270,7 +270,10 @@ test("through the real server: a settle without a final answer is asked about ag
     const verified = verifies();
     notResumed(await call(token));
     notResumed(await call(token, how(wrong)));
-    notResumed(await call(token, how(code.slice(1))));
+    const misshapen = await call(token, how(code.slice(1)));
+    assert.match(misshapen, /INVALID_RESUME_CODE/, misshapen.slice(0, 400));
+    assert.doesNotMatch(misshapen, /accepts/, "no new payment is offered");
+    assert.doesNotMatch(misshapen, /x402\/payment-response/);
     assert.equal(bodies.length, 0, "the facilitator is not asked");
     assert.equal(fs.readFileSync(file, "utf8"), before, "the claim is untouched");
     paidAndRan(await call(token, how(code)));
@@ -279,7 +282,7 @@ test("through the real server: a settle without a final answer is asked about ag
     assert.equal((JSON.parse(fs.readFileSync(file, "utf8")) as { s: string }).s, "settled");
     assert.match(await call(token, how(code)), /PAYMENT_ALREADY_USED/);
   }
-  // Logged once per claim and reason: a missing and a misshapen code are one reason, a wrong code another.
+  // Logged once per claim and reason (a misshapen code is refused before the claim is looked at, and not logged).
   assert.equal(await logged(/an unresolved settlement was not resumed: no resume code/, 2), 2);
   assert.equal(await logged(/an unresolved settlement was not resumed: wrong resume code/, 2), 2);
   assert.equal(await logged(/asking again about an unresolved settlement/, 2), 2);
