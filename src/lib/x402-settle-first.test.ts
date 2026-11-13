@@ -544,6 +544,10 @@ test("the resume code is read from _meta or the X-PAYMENT-RESUME header, and onl
   assert.equal(readResumeCode({ requestInfo: { headers: { "X-PAYMENT-RESUME": code } } }), code);
   assert.equal(readResumeCode({ requestInfo: { headers: { "x-payment-resume": code } } }), code);
   assert.equal(readResumeCode({ _meta: { "x402/resume": code }, requestInfo: { headers: { "x-payment-resume": "c".repeat(43) } } }), code);
+  // A value in _meta that is not shaped like a code does not hide the one in the header.
+  for (const junk of ["", "short", 42, null]) {
+    assert.equal(readResumeCode({ _meta: { "x402/resume": junk }, requestInfo: { headers: { "x-payment-resume": code } } }), code, JSON.stringify(junk));
+  }
   for (const bad of ["", "short", code + "b", code.slice(1) + "=", code.slice(1) + "/", " " + code.slice(1), 42, null, { code }, [code]]) {
     assert.equal(readResumeCode({ _meta: { "x402/resume": bad } }), undefined, JSON.stringify(bad));
   }
@@ -562,24 +566,70 @@ test("the resume code is read from _meta or the X-PAYMENT-RESUME header, and onl
   assert.equal(h.events.filter((e) => e === "tool").length, 1);
 });
 
-test("a record whose resume-code hash cannot be read is a used payment, not one that asks for no code", async () => {
-  const h = harness();
+test("a record whose resume-code hash cannot be read asks for no code and offers no new payment: nobody resumes it", async () => {
+  const h = harness({ preflight: () => null });
   const tok = token("pay-rc3");
   const file = path.join(h.claimsDir, `${paymentClaimKey(decodePayment(tok))}.claim`);
   const call = paidCallId("echo", {});
   const record = (rc: unknown) => JSON.stringify({ s: "unresolved", t: h.clock.now, f: h.clock.now, call, body: "{}", rc });
   for (const rc of ["", "not-a-hash", "A".repeat(64), "a".repeat(63), 7, null, { hash: "a".repeat(64) }]) {
     fs.writeFileSync(file, record(rc));
-    assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED", JSON.stringify(rc));
-    assert.equal(errorCode(await h.handler({}, resume(tok, WRONG_CODE))), "PAYMENT_ALREADY_USED", JSON.stringify(rc));
+    for (const extra of [paid(tok), resume(tok, WRONG_CODE), resume(tok, typeof rc === "string" ? rc : "x")]) {
+      const result = await h.handler({}, extra);
+      assert.equal(errorCode(result), SETTLEMENT_UNRESOLVED, JSON.stringify(rc));
+      assert.equal(x402Error(result).accepts, undefined, "the payment may be taken: no new one is offered");
+      assert.equal(x402Error(result).resumeCode, undefined);
+      assert.match(String(x402Error(result).message), /cannot read this payment's record right now/);
+    }
+    assert.equal(fs.readFileSync(file, "utf8"), record(rc), "the claim is untouched");
   }
-  assert.deepEqual(paymentEvents(h.events), [], "nothing was asked of the facilitator");
+  assert.deepEqual(paymentEvents(h.events), [], "nothing was asked of the facilitator, and the readiness check did not run");
+  // Other arguments, and a settlement past its 23 hours, are a used payment as for any record.
+  assert.equal(errorCode(await h.handler({ x: "other" }, paid(tok))), "PAYMENT_ALREADY_USED");
+  h.clock.now += 23 * 60 * 60 * 1000;
+  assert.equal(errorCode(await h.handler({}, paid(tok))), "PAYMENT_ALREADY_USED");
+  h.clock.now -= 23 * 60 * 60 * 1000;
   // The control: the same record with a readable hash is an unresolved settlement that wants its code.
   fs.writeFileSync(file, record(sha256hex("c".repeat(43))));
   assertNotResumed(await h.handler({}, paid(tok)));
   assert.deepEqual(paymentEvents(h.events), []);
   assert.equal((await h.handler({}, resume(tok, "c".repeat(43)))).isError, undefined);
-  assert.deepEqual(paymentEvents(h.events), ["settle", "tool"], "with the code, the facilitator is asked and the call runs");
+  assert.deepEqual(paymentEvents(h.events), ["preflight", "settle", "tool"], "with the code, the facilitator is asked and the call runs");
+});
+
+test("the resume code is checked again when the settlement is taken over: a record that changed during the readiness check is not resumed on the first look", async () => {
+  // The first look at the claim and the takeover are two steps with the readiness check between them. Whatever the
+  // claim says at the takeover decides.
+  for (const legacy of [false, true]) {
+    const claimsDir = tempDir();
+    const events: string[] = [];
+    const first = harness({ claimsDir, events, settleBody: async () => PENDING });
+    const tok = token(`pay-rc4-${legacy}`);
+    const unresolved = await first.handler({}, paid(tok));
+    const code = resumeCodeOf(unresolved);
+    if (legacy) dropResumeHash(claimsDir);
+    const file = path.join(claimsDir, claimFiles(claimsDir)[0]);
+    let open: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const waiting = harness({ claimsDir, events, settleBody: async () => SETTLED, preflight: () => gate.then(() => null) });
+    const asked = events.filter((e) => e === "settle").length;
+    // With its code (or, for a record from before resume codes, without one) the call passes the first look.
+    const call = waiting.handler({}, legacy ? paid(tok) : resume(tok, code));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(events.filter((e) => e === "preflight").length, 1, "the first look let it through to the readiness check");
+    // Meanwhile the claim comes to hold another code's hash.
+    const record = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    fs.writeFileSync(file, JSON.stringify({ ...record, rc: sha256hex("z".repeat(43)) }));
+    const changed = fs.readFileSync(file, "utf8");
+    open();
+    assertNotResumed(await call);
+    assert.equal(events.filter((e) => e === "settle").length, asked, "the facilitator is not asked");
+    assert.equal(events.includes("tool"), false);
+    assert.equal(fs.readFileSync(file, "utf8"), changed, "the claim is untouched");
+    assert.deepEqual(leftovers(claimsDir), []);
+  }
 });
 
 test("classifySettle: only a definite answer is a failure", () => {
@@ -666,8 +716,17 @@ test("a settlement whose call never answered cannot be resumed, even after ten m
   assert.equal(events.filter((e) => e === "preflight").length, 0, "the readiness check is not set off");
   assert.equal(events.filter((e) => e === "tool").length, 0);
   assert.equal(fs.readFileSync(path.join(claimsDir, claimFiles(claimsDir)[0]), "utf8"), before, "the claim is untouched");
-  assert.equal(second.logs.filter((l) => l.includes("an unresolved settlement was not resumed: no resume code")).length, 2);
-  assert.equal(second.logs.filter((l) => l.includes("an unresolved settlement was not resumed: wrong resume code")).length, 1);
+  // Refused resumes are logged once per claim and reason in ten minutes, however many calls there are.
+  const refusedLogs = (why: string) => second.logs.filter((l) => l.includes(`an unresolved settlement was not resumed: ${why}`)).length;
+  assert.equal(refusedLogs("no resume code"), 1, "a missing and a misshapen code are one reason");
+  assert.equal(refusedLogs("wrong resume code"), 1);
+  for (let i = 0; i < 50; i++) assertNotResumed(await second.handler({ x: "a" }, resume(tok, WRONG_CODE)));
+  assert.equal(refusedLogs("wrong resume code"), 1);
+  clock.now += 10 * 60 * 1000;
+  assertNotResumed(await second.handler({ x: "a" }, paid(tok)));
+  assert.equal(refusedLogs("no resume code"), 2);
+  assert.equal(events.filter((e) => e === "settle").length, 1);
+  assert.equal(fs.readFileSync(path.join(claimsDir, claimFiles(claimsDir)[0]), "utf8"), before);
 
   // The call that owns the settlement is still the only one that can finish it.
   answerFirst({ success: true, transaction: "sig-own", network: "solana", payer: "Payer1111" });
@@ -727,17 +786,22 @@ test("a call that comes back late with a refusal, after a later call took its se
   const tok = token("pay-u7b");
   const firstCall = first.handler({}, paid(tok));
   await new Promise((resolve) => setImmediate(resolve));
-  // A record as the version before resume codes wrote it: it asks for no code, and gets one when it is taken over.
+  // A record as the version before resume codes wrote it. It asks for no code and is given none: whoever resumed it
+  // first would otherwise hold the only code, and lock out the caller the payment belongs to.
   dropResumeHash(claimsDir);
   clock.now += 10 * 60 * 1000;
   const second = harness({ claimsDir, clock, settleBody: async () => PENDING });
   const taken = await second.handler({}, paid(tok));
   assert.equal(errorCode(taken), SETTLEMENT_UNRESOLVED);
+  assert.equal(x402Error(taken).resumeCode, undefined);
+  assert.doesNotMatch(String(x402Error(taken).message), /resume code/);
+  assert.match(String(x402Error(taken).message), /Present the same payment with the same call again to get the result/);
   assert.equal(onlyClaim(claimsDir).s, "unresolved");
-  assert.equal(onlyClaim(claimsDir).rc, sha256hex(resumeCodeOf(taken)), "from here on the claim asks for the code it gave");
+  assert.equal(onlyClaim(claimsDir).rc, undefined, "the record stays as the earlier version wrote it");
   const asked = second.events.filter((e) => e === "settle").length;
-  assertNotResumed(await second.handler({}, paid(tok)));
-  assert.equal(second.events.filter((e) => e === "settle").length, asked);
+  assert.equal(errorCode(await second.handler({}, paid(tok))), SETTLEMENT_UNRESOLVED);
+  assert.ok(second.events.filter((e) => e === "settle").length > asked, "the same call resumes it again, as before resume codes");
+  assert.equal(onlyClaim(claimsDir).rc, undefined);
   answerFirst({ success: false, errorReason: "insufficient_funds", transaction: "", network: "solana" });
   const stale = await firstCall;
   assert.equal(errorCode(stale), SETTLEMENT_UNRESOLVED);
@@ -1366,11 +1430,18 @@ test("a call none of whose settle requests ever connected has sent nothing: that
       return refusedConnection();
     },
   });
-  assert.equal(errorCode(await later.handler({}, paid(token("pay-u22b")))), SETTLEMENT_UNRESOLVED);
+  const laterToken = token("pay-u22b");
+  const unresolved = await later.handler({}, paid(laterToken));
+  assert.equal(errorCode(unresolved), SETTLEMENT_UNRESOLVED);
   assert.equal(onlyClaim(later.claimsDir).s, "unresolved");
   // And on a resume, silence never releases: an earlier call already sent the request.
   attempt = 1;
-  assert.equal(errorCode(await later.handler({}, paid(token("pay-u22b")))), SETTLEMENT_UNRESOLVED);
+  const asked = later.events.filter((e) => e === "settle").length;
+  const resumed = await later.handler({}, resume(laterToken, unresolved));
+  assert.equal(errorCode(resumed), SETTLEMENT_UNRESOLVED);
+  assert.equal(x402Error(resumed).accepts, undefined);
+  assert.match(String(x402Error(resumed).message), /sent for settlement and the outcome is not known yet/);
+  assert.ok(later.events.filter((e) => e === "settle").length > asked, "the resume asked the facilitator, and none of its requests connected");
   assert.equal(onlyClaim(later.claimsDir).s, "unresolved");
 });
 

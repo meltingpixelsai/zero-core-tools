@@ -229,8 +229,15 @@ test("through the real server: a settle without a final answer is asked about ag
   assert.match(expired, /accepts/);
   assert.equal(bodies.length, 2);
 
-  assert.match(out(), /settle failed, tool not run: reason=free_tier_exhausted/);
-  assert.match(out(), /settle failed, tool not run: reason=invalid_transaction_state/);
+  // The server's log arrives through a pipe, a moment after the HTTP answer it belongs to: wait for a line, don't
+  // read once.
+  const logged = async (line: RegExp, times = 1) => {
+    const count = () => (out().match(new RegExp(line.source, "g")) ?? []).length;
+    for (let waited = 0; count() < times && waited < 5_000; waited += 50) await new Promise((r) => setTimeout(r, 50));
+    return count();
+  };
+  assert.equal(await logged(/settle failed, tool not run: reason=free_tier_exhausted/), 1);
+  assert.equal(await logged(/settle failed, tool not run: reason=invalid_transaction_state/), 1);
   assert.doesNotMatch(out(), /settlement unresolved/);
 
   // 5. An unresolved settlement, as an earlier call would have left it after 45 seconds of no final answer (the
@@ -272,7 +279,9 @@ test("through the real server: a settle without a final answer is asked about ag
     assert.equal((JSON.parse(fs.readFileSync(file, "utf8")) as { s: string }).s, "settled");
     assert.match(await call(token, how(code)), /PAYMENT_ALREADY_USED/);
   }
-  assert.equal((out().match(/an unresolved settlement was not resumed: no resume code/g) ?? []).length, 4, "a missing and a misshapen code are logged alike");
-  assert.equal((out().match(/an unresolved settlement was not resumed: wrong resume code/g) ?? []).length, 2);
+  // Logged once per claim and reason: a missing and a misshapen code are one reason, a wrong code another.
+  assert.equal(await logged(/an unresolved settlement was not resumed: no resume code/, 2), 2);
+  assert.equal(await logged(/an unresolved settlement was not resumed: wrong resume code/, 2), 2);
+  assert.equal(await logged(/asking again about an unresolved settlement/, 2), 2);
   assert.equal(out().includes(code) || out().includes(wrong), false, "no resume code is ever logged");
 });
