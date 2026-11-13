@@ -22,6 +22,14 @@
  * is unknown and is not offered a new payment, and presenting the same payment
  * with the same call later asks once more: the tool then runs, or the claim is
  * released because nothing was taken.
+ * Resuming needs the payment's resume code as well. The code is made when the
+ * settle request is recorded, only its SHA-256 is kept in the claim, and the
+ * caller gets it with the answer that the outcome is unknown (`resumeCode`),
+ * to present as `_meta["x402/resume"]` or an X-PAYMENT-RESUME header. A payment
+ * is public once it is on chain and a call's arguments can sometimes be guessed;
+ * the code is known only to whoever received that answer. A call that was cut
+ * off before it could answer has handed out no code, so its settlement cannot
+ * be resumed.
  * A tool may name a readiness check (`preflight`) for what it depends on; it
  * runs between 2 and 3, and a refusal releases the claim and settles nothing.
  * Claims are marker files in one directory shared by every server that takes
@@ -37,7 +45,7 @@
  * Requirement building and payment-token parsing follow mcpay 0.1.17
  * (MIT License, Copyright (c) MCPay). Solana ("svm") recipients only.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -185,32 +193,64 @@ const UNRESOLVED_REASONS = new Set([
   "settle_exact_svm_transaction_confirmation_timed_out",
 ]);
 
+/** Where a caller presents a resume code: this `_meta` key of the tool call, or this HTTP header. */
+export const RESUME_META_KEY = "x402/resume";
+export const RESUME_HEADER = "X-PAYMENT-RESUME";
+const HOW_TO_RESUME = `with the resume code given here as _meta["${RESUME_META_KEY}"] (or the ${RESUME_HEADER} header)`;
+
 const UNRESOLVED_MESSAGE =
   "This payment was sent for settlement and the outcome is not known yet: it may still be taken. Do not send a new payment for this call. " +
-  "Present the same payment with the same call again to get the result, or a definite answer that nothing was taken.";
+  `Present the same payment with the same call again, ${HOW_TO_RESUME}, to get the result, or a definite answer that nothing was taken.`;
 const IN_PROGRESS_MESSAGE =
-  "An earlier call with this payment is still in progress. Do not send a new payment for this call. Present the same payment with the same call again shortly.";
+  "An earlier call with this payment is still in progress. Do not send a new payment for this call. Wait for that call's answer: " +
+  "if it reports the outcome as unknown, it gives a resume code to present with the same payment and the same call.";
 const NOT_RECORDED_MESSAGE =
   "This payment was settled, but the call could not be recorded as paid, so it was not run. Do not send a new payment for this call. " +
-  "Present the same payment with the same call again after the time given to get the result.";
+  `Present the same payment with the same call again after the time given, ${HOW_TO_RESUME}, to get the result.`;
+const RESUME_CODE_MESSAGE =
+  "The outcome of this payment is not known, and this call did not present the payment's resume code. Do not send a new payment for this call. " +
+  `The call that sent the payment for settlement was given a resume code with its answer: present the same payment with the same call and that code as _meta["${RESUME_META_KEY}"] (or the ${RESUME_HEADER} header).`;
 const CLAIM_UNAVAILABLE_MESSAGE = "The service cannot record payments right now, so this call sent nothing for settlement. Try again later.";
 const CLAIM_UNREADABLE_MESSAGE =
   "The service cannot read this payment's record right now. Do not send a new payment for this call. Present the same payment with the same call again later.";
 const NOT_READY_MESSAGE =
   "The service is not ready to run this call yet, and the outcome of its payment is not known. Do not send a new payment for this call. " +
-  "Present the same payment with the same call again later.";
+  "Present the same payment with the same call and the same resume code again later.";
+
+/** A resume code: 32 random bytes as base64url. */
+const RESUME_CODE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const RESUME_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+function newResumeCode(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+/** What a claim keeps of its resume code. The code itself is never written anywhere. */
+function resumeCodeHash(code: string): string {
+  return createHash("sha256").update(code).digest("hex");
+}
+
+/** Whether `code` is the resume code whose hash a claim holds. Anything that is not shaped like a code is not. */
+function resumeCodeMatches(code: string | undefined, hash: string): boolean {
+  if (typeof code !== "string" || !RESUME_CODE_PATTERN.test(code) || !RESUME_HASH_PATTERN.test(hash)) return false;
+  return timingSafeEqual(Buffer.from(resumeCodeHash(code), "hex"), Buffer.from(hash, "hex"));
+}
 
 /**
  * A claim's record. `t`: when it was last written. `call` names the call (tool and arguments) the payment was
  * presented with; a "pending" record written by the previous version of this file has none. `o` marks the call that
  * owns a settlement in progress; `body` is the settle request, so a later call can resume it; `f` is when that
- * request was first sent.
+ * request was first sent; `rc` is the SHA-256 of the payment's resume code (a record written by the version of this
+ * file before resume codes has none).
  */
 type ClaimRecord =
   | { s: "pending"; t: number; call?: string }
-  | { s: "settling"; t: number; f: number; o: string; call: string; body: string; tx?: string; paid?: PaidMark }
-  | { s: "unresolved"; t: number; f: number; call: string; body: string; tx?: string; paid?: PaidMark }
+  | { s: "settling"; t: number; f: number; o: string; call: string; body: string; rc?: string; tx?: string; paid?: PaidMark }
+  | { s: "unresolved"; t: number; f: number; call: string; body: string; rc?: string; tx?: string; paid?: PaidMark }
   | { s: "settled"; t: number; tx?: string };
+
+/** A settlement this call owns: its owner mark and the payment's resume code. */
+type OwnedSettlement = { owner: string; code: string };
 
 /**
  * The facilitator has answered that the payment settled, and the tool has not run: the claim could not be marked
@@ -238,8 +278,14 @@ function parseClaim(text: string): ClaimRecord | null {
   if (typeof rec.body !== "string" || rec.body.length > MAX_SETTLE_BODY_LENGTH) return null;
   const mark = rec.paid as { tx?: unknown; network?: unknown } | null | undefined;
   const paid = mark && typeof mark === "object" && typeof mark.tx === "string" && typeof mark.network === "string" ? { paid: { tx: mark.tx, network: mark.network } } : {};
-  if (rec.s === "unresolved") return { s: "unresolved", t: rec.t, f: rec.f, call: rec.call, body: rec.body, ...tx, ...paid };
-  if (rec.s === "settling" && typeof rec.o === "string") return { s: "settling", t: rec.t, f: rec.f, o: rec.o, call: rec.call, body: rec.body, ...tx, ...paid };
+  let rc: { rc?: string } = {};
+  if (rec.rc !== undefined) {
+    // A resume-code hash this code cannot read is not "no resume code": the record is not one of ours.
+    if (typeof rec.rc !== "string" || !RESUME_HASH_PATTERN.test(rec.rc)) return null;
+    rc = { rc: rec.rc };
+  }
+  if (rec.s === "unresolved") return { s: "unresolved", t: rec.t, f: rec.f, call: rec.call, body: rec.body, ...rc, ...tx, ...paid };
+  if (rec.s === "settling" && typeof rec.o === "string") return { s: "settling", t: rec.t, f: rec.f, o: rec.o, call: rec.call, body: rec.body, ...rc, ...tx, ...paid };
   return null;
 }
 const FEE_PAYER_TTL_MS = 10 * 60 * 1000;
@@ -386,20 +432,22 @@ export class ClaimStore {
 
   /**
    * The claimant has verified the payment and is about to send it for settlement: record the call and the exact
-   * request, so the settlement can be resumed if this call cannot finish it. Returns the mark that makes this call
-   * the settlement's owner, or null when the record could not be written (nothing has been sent then).
+   * request, so the settlement can be resumed if this call cannot finish it, and the hash of a new resume code, so
+   * that only a caller this call has answered can resume it. Returns the mark that makes this call the settlement's
+   * owner with that code, or null when the record could not be written (nothing has been sent then).
    */
-  markSettling(key: string, call: string, body: string): string | null {
+  markSettling(key: string, call: string, body: string): OwnedSettlement | null {
     if (body.length > MAX_SETTLE_BODY_LENGTH) {
       // A record this long could not be read back, and a settlement that cannot be resumed is not started.
       this.log(`[x402] settle request too long to record (${body.length} characters): shorten the tool's description`);
       return null;
     }
     const owner = randomUUID();
+    const code = newResumeCode();
     const now = this.now();
     try {
-      this.write(key, { s: "settling", t: now, f: now, o: owner, call, body });
-      return owner;
+      this.write(key, { s: "settling", t: now, f: now, o: owner, call, body, rc: resumeCodeHash(code) });
+      return { owner, code };
     } catch (err) {
       this.log(`[x402] could not record a settlement before sending it: ${String(err)}`);
       return null;
@@ -412,11 +460,14 @@ export class ClaimStore {
    *             this code knows, a payment claimed long ago and never sent for settlement, a settlement too old to
    *             ask about);
    *   "open"    an earlier presentation of this same call is at work on it right now;
-   *   "resume"  the call's settlement was left unresolved (or its owner is gone): this call may ask about it again;
+   *   "resume"  the call's settlement was left unresolved (or its owner is gone) and `code` is the payment's resume
+   *             code: this call may ask about it again (a record from before resume codes holds no hash and asks for
+   *             none);
+   *   "denied"  the same, but `code` is missing or is not the payment's resume code;
    *   "unknown" the claim file is there and could not be read.
    * Reads only.
    */
-  heldFor(key: string, call: string): "used" | "open" | "resume" | "unknown" {
+  heldFor(key: string, call: string, code?: string): "used" | "open" | "resume" | "denied" | "unknown" {
     let rec: ClaimRecord | null;
     try {
       rec = this.read(key);
@@ -431,25 +482,33 @@ export class ClaimStore {
     // verify that hangs far beyond the life of the payment (a Solana payment expires in about a minute).
     if (rec.s === "pending") return fresh ? "open" : "used";
     if (this.now() - rec.f >= RESUME_WINDOW_MS) return "used";
-    return rec.s === "settling" && fresh ? "open" : "resume";
+    if (rec.s === "settling" && fresh) return "open";
+    return rec.rc === undefined || resumeCodeMatches(code, rec.rc) ? "resume" : "denied";
   }
 
   /**
-   * Makes the calling call the owner of a settlement that `heldFor` reports as "resume". Returns the owner mark, the
-   * request to send again, the transaction the facilitator named (if any) and the mark of a payment already known
-   * to be settled (if any); or "open" / "used" when another call got there first.
+   * Makes the calling call the owner of a settlement that `heldFor` reports as "resume" for `code`. Returns the
+   * owner mark, the payment's resume code, the request to send again, the transaction the facilitator named (if any)
+   * and the mark of a payment already known to be settled (if any); or "open" / "used" when another call got there
+   * first, or "denied" when `code` is not the payment's resume code. The code stays the same for the life of the
+   * claim, so an answer that is lost on its way to the caller does not take the caller's way back with it. A record
+   * from before resume codes gets one here, and asks for it from then on.
    */
-  takeOver(key: string, call: string): { owner: string; body: string; tx: string; paid?: PaidMark } | "open" | "used" {
-    let taken: { value: { owner: string; body: string; tx: string; paid?: PaidMark } | "open" | "used" } | null;
+  takeOver(key: string, call: string, code?: string): (OwnedSettlement & { body: string; tx: string; paid?: PaidMark }) | "open" | "used" | "denied" {
+    type Taken = (OwnedSettlement & { body: string; tx: string; paid?: PaidMark }) | "open" | "used" | "denied";
+    const refusal = (state: "used" | "open" | "denied" | "unknown"): "open" | "used" | "denied" => (state === "unknown" ? "open" : state);
+    let taken: { value: Taken } | null;
     try {
-      taken = this.locked(key, () => {
-        const state = this.heldFor(key, call);
-        if (state !== "resume") return state === "used" ? "used" : "open";
+      taken = this.locked(key, (): Taken => {
+        const state = this.heldFor(key, call, code);
+        if (state !== "resume") return refusal(state);
         const rec = this.read(key) as Extract<ClaimRecord, { s: "settling" | "unresolved" }>;
         const owner = randomUUID();
+        // `heldFor` has just matched `code` against the record's hash; a record without one gets a new code.
+        const held = rec.rc !== undefined && code !== undefined ? code : newResumeCode();
         const kept = { ...(rec.tx ? { tx: rec.tx } : {}), ...(rec.paid ? { paid: rec.paid } : {}) };
-        this.write(key, { s: "settling", t: this.now(), f: rec.f, o: owner, call, body: rec.body, ...kept });
-        return { owner, body: rec.body, tx: rec.tx ?? "", ...(rec.paid ? { paid: rec.paid } : {}) };
+        this.write(key, { s: "settling", t: this.now(), f: rec.f, o: owner, call, body: rec.body, rc: rec.rc ?? resumeCodeHash(held), ...kept });
+        return { owner, code: held, body: rec.body, tx: rec.tx ?? "", ...(rec.paid ? { paid: rec.paid } : {}) };
       });
     } catch (err) {
       this.log(`[x402] could not take over an unresolved settlement: ${String(err)}`);
@@ -457,7 +516,8 @@ export class ClaimStore {
     }
     if (taken) return taken.value;
     // Another process is changing this claim right now.
-    return this.heldFor(key, call) === "used" ? "used" : "open";
+    const state = this.heldFor(key, call, code);
+    return state === "resume" ? "open" : refusal(state);
   }
 
   /**
@@ -480,7 +540,8 @@ export class ClaimStore {
         // does the mark of a payment known to be settled.
         const tx = end.tx || rec.tx;
         const paid = end.paid ?? rec.paid;
-        this.write(key, { s: "unresolved", t: this.now(), f: rec.f, call: rec.call, body: rec.body, ...(tx ? { tx } : {}), ...(paid ? { paid } : {}) });
+        const rc = rec.rc !== undefined ? { rc: rec.rc } : {};
+        this.write(key, { s: "unresolved", t: this.now(), f: rec.f, call: rec.call, body: rec.body, ...rc, ...(tx ? { tx } : {}), ...(paid ? { paid } : {}) });
       }
       return "done";
     };
@@ -700,6 +761,25 @@ export function readPaymentToken(extra: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Read the resume code from MCP `_meta["x402/resume"]` or an X-PAYMENT-RESUME header. Only a string shaped like a
+ * resume code is returned, so nothing else a caller sends here is ever hashed or compared.
+ */
+export function readResumeCode(extra: unknown): string | undefined {
+  const ex = (extra ?? {}) as { _meta?: Record<string, unknown>; requestInfo?: { headers?: unknown } };
+  let value: unknown = ex._meta?.[RESUME_META_KEY];
+  const headers = ex.requestInfo?.headers;
+  if (typeof value !== "string" && headers) {
+    if (typeof (headers as { get?: unknown }).get === "function") {
+      value = (headers as { get: (name: string) => string | null }).get(RESUME_HEADER);
+    } else if (typeof headers === "object") {
+      const rec = headers as Record<string, unknown>;
+      value = rec[RESUME_HEADER] ?? rec[RESUME_HEADER.toLowerCase()];
+    }
+  }
+  return typeof value === "string" && RESUME_CODE_PATTERN.test(value) ? value : undefined;
+}
+
 function errorResult(payload: Record<string, unknown>): ToolResult {
   return {
     isError: true,
@@ -734,7 +814,7 @@ function canonicalJson(value: unknown, depth = 0): string {
  * Names one call: the tool and its arguments. An unresolved settlement is resumed only by the call that started it.
  * Once a payment is on chain anyone can read it there and present it, so the payment alone must not be enough; the
  * arguments are not on chain. They are not a secret either (some can be guessed, and a proxy sees them): this
- * narrows who can resume a settlement, it does not prove who paid.
+ * narrows who can resume a settlement, it does not prove who paid. The resume code does the rest: see `readResumeCode`.
  */
 export function paidCallId(name: string, args: unknown): string {
   return createHash("sha256").update(name).update("\n").update(canonicalJson(args)).digest("hex");
@@ -990,14 +1070,18 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         if (!key || !payer || payer === feePayer) return paymentRequired("INVALID_PAYMENT");
 
         const call = paidCallId(name, args);
-        /** The outcome of the payment is not known. No `accepts`: a client must not be led to pay a second time. */
-        const unresolved = (transaction: string, message = UNRESOLVED_MESSAGE, retryAfterSeconds = UNRESOLVED_RETRY_SECONDS): ToolResult =>
+        /**
+         * The outcome of the payment is not known. No `accepts`: a client must not be led to pay a second time.
+         * `resumeCode`: only from a call that owns, or owned, the payment's settlement.
+         */
+        const unresolved = (transaction: string, message = UNRESOLVED_MESSAGE, retryAfterSeconds = UNRESOLVED_RETRY_SECONDS, resumeCode?: string): ToolResult =>
           errorResult({
             x402Version,
             error: SETTLEMENT_UNRESOLVED,
             message,
             ...(signatureOf(transaction) ? { transaction } : {}),
             retryAfterSeconds,
+            ...(resumeCode ? { resumeCode } : {}),
           });
         /** The claim directory cannot be used, so this call sends nothing for settlement. No `accepts` either. */
         const unavailable = (): ToolResult => errorResult({ x402Version, error: "PAYMENT_CLAIM_UNAVAILABLE", message: CLAIM_UNAVAILABLE_MESSAGE });
@@ -1009,26 +1093,29 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
 
         /**
          * Settles the payment whose settlement this call owns, then runs the tool. `paid`: an earlier call already
-         * had the facilitator's answer that the payment settled, so it is not asked again.
+         * had the facilitator's answer that the payment settled, so it is not asked again. Every answer here that
+         * leaves the outcome open carries the payment's resume code.
          */
-        const settleAndRun = async (owner: string, body: string, again: boolean, known = "", paid?: PaidMark): Promise<ToolResult> => {
+        const settleAndRun = async ({ owner, code }: OwnedSettlement, body: string, again: boolean, known = "", paid?: PaidMark): Promise<ToolResult> => {
+          const open = (transaction: string, message = UNRESOLVED_MESSAGE, retryAfterSeconds = UNRESOLVED_RETRY_SECONDS): ToolResult =>
+            unresolved(transaction, message, retryAfterSeconds, code);
           const outcome: SettleOutcome = paid ? { kind: "settled", transaction: paid.tx, network: paid.network } : await resolveSettlement(body, again, known);
           const tx = brief(outcome.transaction) || "-";
           if (outcome.kind === "failed") {
             const ended = await endClaim(key, owner, { s: "released" });
             const note = outcome.note ? ` (${brief(outcome.note)})` : "";
             log(`[x402] ${name}: settle failed, tool not run: reason=${brief(outcome.reason)}${note} tx=${tx} payer=${payer}`);
-            return ended === "lost" ? unresolved(outcome.transaction) : paymentRequired(outcome.reason);
+            return ended === "lost" ? open(outcome.transaction) : paymentRequired(outcome.reason);
           }
           if (outcome.kind === "unresolved") {
             const kept = await endClaim(key, owner, { s: "unresolved", tx: signatureOf(outcome.transaction) });
             log(`[x402] ${name}: settlement unresolved, claim kept, tool not run: reason=${brief(outcome.reason)} tx=${tx} payer=${payer}`);
-            return unresolved(outcome.transaction, UNRESOLVED_MESSAGE, kept === "error" ? STUCK_RETRY_SECONDS : UNRESOLVED_RETRY_SECONDS);
+            return open(outcome.transaction, UNRESOLVED_MESSAGE, kept === "error" ? STUCK_RETRY_SECONDS : UNRESOLVED_RETRY_SECONDS);
           }
           const recorded = await endClaim(key, owner, { s: "settled", tx: outcome.transaction });
           if (recorded === "lost") {
             log(`[x402] ${name}: settled, but this call no longer owns the settlement (a later call took it over), tool not run here: tx=${tx} payer=${payer}`);
-            return unresolved(outcome.transaction);
+            return open(outcome.transaction);
           }
           if (recorded === "error") {
             // Run now and the claim would still read as a settlement in progress: the same call could resume it
@@ -1038,7 +1125,7 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
             const paidMark = { tx: outcome.transaction, network: outcome.network };
             const kept = await endClaim(key, owner, { s: "unresolved", tx: signatureOf(outcome.transaction), paid: paidMark });
             log(`[x402] ${name}: settled (paid), but the claim could not be marked settled, tool not run: tx=${tx} payer=${payer}`);
-            return unresolved(outcome.transaction, NOT_RECORDED_MESSAGE, kept === "done" ? UNRESOLVED_RETRY_SECONDS : STUCK_RETRY_SECONDS);
+            return open(outcome.transaction, NOT_RECORDED_MESSAGE, kept === "done" ? UNRESOLVED_RETRY_SECONDS : STUCK_RETRY_SECONDS);
           }
 
           const settlement: X402Settlement = {
@@ -1074,11 +1161,18 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
         }
         if (!claimed) {
           // The payment is claimed. For any other call it is in use or used up. For this same call it is either
-          // still at work (no new payment is offered while it may yet be taken) or was left unresolved (resume it).
-          const held = claims.heldFor(key, call);
+          // still at work (no new payment is offered while it may yet be taken) or was left unresolved: resume it,
+          // if the caller holds the payment's resume code.
+          const resumeCode = readResumeCode(extra);
+          const denied = (): ToolResult => {
+            log(`[x402] ${name}: an unresolved settlement was not resumed: ${resumeCode ? "wrong resume code" : "no resume code"} payer=${payer}`);
+            return unresolved("", RESUME_CODE_MESSAGE);
+          };
+          const held = claims.heldFor(key, call, resumeCode);
           if (held === "used") return paymentRequired("PAYMENT_ALREADY_USED");
           if (held === "open") return unresolved("", IN_PROGRESS_MESSAGE);
           if (held === "unknown") return unresolved("", CLAIM_UNREADABLE_MESSAGE);
+          if (held === "denied") return denied();
           if (options.preflight) {
             // The payment may already be taken, so nothing is promised here: the settlement stays as it is.
             let notReady: string | null;
@@ -1093,12 +1187,13 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
               return unresolved("", NOT_READY_MESSAGE);
             }
           }
-          const taken = claims.takeOver(key, call);
+          const taken = claims.takeOver(key, call, resumeCode);
           if (taken === "used") return paymentRequired("PAYMENT_ALREADY_USED");
           if (taken === "open") return unresolved("", IN_PROGRESS_MESSAGE);
+          if (taken === "denied") return denied();
           if (taken.paid) log(`[x402] ${name}: resuming a settled payment whose call has not run: tx=${brief(taken.paid.tx) || "-"} payer=${payer}`);
           else log(`[x402] ${name}: asking again about an unresolved settlement: tx=${brief(taken.tx) || "-"} payer=${payer}`);
-          return settleAndRun(taken.owner, taken.body, true, taken.tx, taken.paid);
+          return settleAndRun(taken, taken.body, true, taken.tx, taken.paid);
         }
 
         let verified: VerifyResponse;
@@ -1136,13 +1231,13 @@ export function createSettleFirstPaidTools(cfg: SettleFirstConfig, deps: SettleF
           paymentPayload: toJsonSafe(decoded),
           paymentRequirements: toJsonSafe(selected),
         });
-        const owner = claims.markSettling(key, call, body);
-        if (!owner) {
+        const owned = claims.markSettling(key, call, body);
+        if (!owned) {
           claims.release(key);
           log(`[x402] ${name}: payment claim store unavailable, payment not sent for settlement, tool not run payer=${payer}`);
           return unavailable();
         }
-        return settleAndRun(owner, body, false);
+        return settleAndRun(owned, body, false);
       });
     };
   };
